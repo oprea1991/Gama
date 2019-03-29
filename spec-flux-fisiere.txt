@@ -1,0 +1,36 @@
+CREATE OR REPLACE PACKAGE INSIS_LIFE_BTA.PPI_DD_FLUX_FISIERE
+AS
+   PROCEDURE DIRECT_DEBIT_OTP (report_date DATE, id_frame VARCHAR2);
+
+   PROCEDURE GENEREAZA_INCASARI_OTP (V_FILE_NAME VARCHAR2,P_MESAJ_PT_GNR VARCHAR2);
+
+   PROCEDURE IMPORT_FISIERE_OTP (V_ID NUMBER);
+
+   PROCEDURE load_direct_debit_OTP (report_date DATE DEFAULT SYSDATE);
+
+   PROCEDURE LOAD_FIS_CLI_COMIS_OTP (report_date DATE DEFAULT SYSDATE);
+
+   PROCEDURE OTP_BORDEROU_COMISION (DATA_RAPORT         DATE,
+                                    PROCENT_COMISION    INT DEFAULT 20);
+
+   PROCEDURE OTP_FISIER_CLIENTI (DATA_RAPORT DATE);
+   PROCEDURE SP_INSERT_RASP_OTP (V_FILE_NAME    VARCHAR2,
+                                                   v_file_id      NUMERIC,
+                                                   text           VARCHAR2,
+                                                   delimitator VARCHAR2,
+                                                   p_mail_to VARCHAR2,
+                                                   p_mail_to_2 VARCHAR2,
+                                                   P_MAIL_ERR VARCHAR2);
+   PROCEDURE SEND_MAIL_LOG(pi_insr_type in number,
+                        pi_subject in varchar2,
+                        pi_msg varchar2);
+  PROCEDURE PPI_PAYMENT_UPLOAD_CHECK_autom (p_id number,P_MAIL_INF VARCHAR2, P_MAIL_ERR VARCHAR2,P_MAIL_TO_1 VARCHAR2,P_MAIL_TO_2 VARCHAR2 );
+  
+   PROCEDURE RUN_PPI_JOB_PAY_AUTOMATIC  (pp_id number );                
+   PROCEDURE INCARCA_FISIERE_OPT ;
+   PROCEDURE INFORMARE_DD (V_FILE_MASK VARCHAR2,NUME_FISIER VARCHAR2, P_COMPANIE VARCHAR2,PARAM_2 VARCHAR2, PARAM_3 VARCHAR2, PARAM_4 VARCHAR2,ALERTA SMALLINT );
+   PROCEDURE LOG_ERROR ( TITLE_IN IN  ERROR_LOG.TITLE%TYPE, 
+                                                                                               INFO_IN  IN  ERROR_LOG.INFO%TYPE);
+                   
+END PPI_DD_FLUX_FISIERE;
+/

@@ -1,0 +1,2129 @@
+CREATE OR REPLACE PACKAGE BODY INSIS_LIFE_BTA.PPI_DD_FLUX_FISIERE AS 
+
+PROCEDURE INFORMARE_DD (V_FILE_MASK VARCHAR2,NUME_FISIER VARCHAR2, P_COMPANIE VARCHAR2,PARAM_2 VARCHAR2, PARAM_3 VARCHAR2, PARAM_4 VARCHAR2,ALERTA SMALLINT )
+IS
+V_MAIL_TO  CONFIGURARE_FTP.MAIL_TO%TYPE;
+V_MAIL_SUBJECT  VARCHAR2 (100);
+V_MESSAGE VARCHAR2 (400);
+V_MAIL_TEXT_1 CONFIGURARE_FTP.MAIL_TEXT_1%TYPE;
+V_MAIL_TEXT_2 CONFIGURARE_FTP.MAIL_TEXT_2%TYPE;
+V_MAIL_TEXT_3 CONFIGURARE_FTP.MAIL_TEXT_3%TYPE;
+V_MAIL_TEXT_4 CONFIGURARE_FTP.MAIL_TEXT_4%TYPE;
+V_COMPANIE_CONTRACT CONFIGURARE_FTP.COMPANIE_CONTRACT%TYPE;
+V_MAIL_ACCOUNT_INFORMARE CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE%TYPE;
+V_MAIL_ACCOUNT_ERORI CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+V_MAIL_TO_2 CONFIGURARE_FTP.MAIL_TO_2 %TYPE;
+
+
+
+
+BEGIN
+
+SELECT 
+        MAIL_TO,
+        MAIL_SUBJECT,
+        MAIL_TEXT_1,
+        MAIL_TEXT_2,
+        MAIL_TEXT_3,
+        MAIL_TEXT_4,
+        COMPANIE_CONTRACT,
+        CASE WHEN STATUS_RULARE = 1 THEN MAIL_ACCOUNT_INFORMARE ELSE MAIL_ACCOUNT_ERORI END AS MAIL_ACCOUNT_INFORMARE,
+        MAIL_ACCOUNT_ERORI,
+        MAIL_TO_2
+        
+INTO
+       V_MAIL_TO,
+       V_MAIL_SUBJECT,
+       V_MAIL_TEXT_1,
+       V_MAIL_TEXT_2,
+       V_MAIL_TEXT_3,
+       V_MAIL_TEXT_4,
+       V_COMPANIE_CONTRACT,
+       V_MAIL_ACCOUNT_INFORMARE,
+       V_MAIL_ACCOUNT_ERORI,
+       V_MAIL_TO_2
+FROM CONFIGURARE_FTP WHERE FILE_MASK = V_FILE_MASK AND COMPANIE_CONTRACT =P_COMPANIE AND ALERTA=STATUS_RULARE;
+
+V_MESSAGE:=V_MAIL_TEXT_1||' '|| NUME_FISIER ||' pentru compania ' || V_COMPANIE_CONTRACT|| '.  ' || chr(10)|| V_MAIL_TEXT_2 ||' '||PARAM_2||'.'|| chr(10)||V_MAIL_TEXT_3||' '||PARAM_3||chr(10)|| V_MAIL_TEXT_4 ||PARAM_4||chr(10); 
+utl_mail.send(V_MAIL_ACCOUNT_INFORMARE, V_MAIL_TO,V_MAIL_TO_2,V_MAIL_TO,V_MAIL_SUBJECT,V_MESSAGE, NULL);  
+
+
+EXCEPTION WHEN OTHERS THEN 
+ PPI_DD_FLUX_FISIERE.LOG_ERROR (     'INFORMARE_DD',     'VALUE  '||V_FILE_MASK  );
+END INFORMARE_DD;
+
+
+
+PROCEDURE DIRECT_DEBIT_OTP (report_date date, id_frame varchar2) as
+    vFile utl_file.file_type;
+    l_conn  UTL_TCP.connection;
+    l_line varchar2(4000);
+    dt_debitare date;
+    V_YEARMMDD VARCHAR2(20);
+    l_file_name varchar2(60);
+    V_numar number;
+    ftp_ip varchar(12);
+    ftp_user varchar(15);
+    ftp_pass varchar (20);
+    dir_from varchar(20);
+    ftp_dir_to varchar (20);
+    ftp_port number;
+    v_start date;
+    v_end date;
+    v_prefix varchar2(15);
+    v_err varchar2(2000);
+    db_dir_pol_bk varchar2 (30);
+    v_SEQ_ID_FISIER NUMBER;
+    v_rows number;
+    v_file_mask varchar2(40);
+    l_size number; 
+    l_block_size number;
+    l_exists boolean ;
+    v_client_name varchar2 (40);
+    V_MAIL_TO           CONFIGURARE_FTP.MAIL_TO%TYPE;
+    V_MAIL_TO_2       CONFIGURARE_FTP.MAIL_TO_2%TYPE;
+    V_MAIL_ACCOUNT_INFORMARE           CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE %TYPE;
+    V_MAIL_ACCOUNT_ERORI       CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+cursor  c_data_otp (p_currency varchar2)  is    
+with baza as
+ (
+  select 
+         'GPM' as Cod_Furnizor,
+         ppi.name Nume,
+      --ppi.egn  as CNP_client modificat de catre CO in data de 04.10.2017 conform cerinta OTP
+         case when pcc.COND_VALUE is null then ppi.egn  else pcc.COND_VALUE END as CNP,
+         p.policy_no Certificat,
+         p.policy_id,
+         i.pay_way,
+         P.DATE_COVERED Data_Scad, 
+        dt_debitare Data_Deb,
+         pc.cond_value IBAN_Client,
+         ' ' Data_emiterii_politei,
+         ' ' as Nr_factura,   
+      --   'RO07BTRL01301202925674XX' IBAN_Groupama,
+         currency Valuta_Suma
+from 
+policy p 
+join insureds i on i.policy_id = p.policy_id ---asigurati 
+join p_people ppi on i.man_id = ppi.man_id
+join policy_conditions pd on pd.policy_id = p.policy_id and pd.cond_type = 'MANDAT_OTP' and pd.cond_dimension ='A'    ---clientul accepta direct debit
+join policy_conditions pc on pc.policy_id = p.policy_id and pc.cond_type = 'IBAN_ASIG'  --EXTRAG iban
+left join policy_conditions pcc on p.policy_id = pcc.policy_id and  pcc.cond_type ='CNP_OTP'   --and pcc.cond_dimension =1
+where 
+--p.date_covered between (dt_debitare- 60) and dt_debitare and --aflate la scadenta in ultimele 60 de zile
+      p.date_covered < P.INSR_END --cover_date<=insr_end.
+and p.insr_type = 5002
+and p.policy_state between 0 and 29 --modificare
+and( p.policy_state <> 11 or p.policy_state_aux <>39) --(mai putine cele cu statusul Active/DEATH) 
+ and p.policy_ref IN  -- ( select framecontract from USR_CFG_TABLE_PPI  where client_code  = 1040023845)
+                                  (   SELECT  framecontract         FROM usr_cfg_interval_ppi WHERE prefix like 'OTPTMK%')
+                                  --prima rata/ rata cadou
+--and to_char (p.date_covered,'mmyyyy') > to_char (p.insr_begin,'mmyyyy')                                  
+                                  
+                                  )
+    
+select  
+            Cod_furnizor,Nume,CNP,Certificat,IBAN_Client,Nr_factura,Data_emiterii_politei,sum(Prima) Prima,Valuta_Suma, Data_deb
+ from ( 
+ 
+--Prima scadenta
+   select 
+        Cod_Furnizor,
+        b.Nume,
+        b.CNP,
+        b.Certificat,
+        b.IBAN_Client,
+        Nr_factura,
+        Data_emiterii_politei,
+        CASE b.pay_way WHEN 12 THEN lp.gross_annual 
+                                              WHEN  6 THEN lp.gross_semiann 
+                                                WHEN  3 THEN lp.gross_quart 
+                                                 WHEN  1 THEN lp.gross_month 
+        END as      Prima,
+        currency Valuta_Suma,
+    --    b.Data_Scad  ,
+        b.Data_Deb
+     --   b.IBAN_Groupama,
+        
+ from baza b 
+ join life_prem lp on lp.POLICY_ID = b.policy_id and lp.status = 'V'
+ where b.Data_Scad between LP.BEGIN_DATE and Data_Deb   and currency in ('EUR', 'RON') 
+ 
+ union  all
+ ---- A 2 - a scadenta
+  select 
+        Cod_Furnizor,
+        b.Nume,
+        b.CNP,
+        b.Certificat,
+        b.IBAN_Client,
+        Nr_factura,
+        Data_emiterii_politei,
+        CASE b.pay_way WHEN 12 THEN lp.gross_annual 
+                                              WHEN  6 THEN lp.gross_semiann 
+                                                WHEN  3 THEN lp.gross_quart 
+                                                 WHEN  1 THEN lp.gross_month 
+        END as      Prima,
+        currency Valuta_Suma,
+    --    b.Data_Scad  ,
+        b.Data_Deb
+     --   b.IBAN_Groupama,
+        
+ from baza b 
+ join life_prem lp on lp.POLICY_ID = b.policy_id and add_months(b.Data_Scad,1) between LP.BEGIN_DATE and Data_Deb and lp.status = 'V'
+ where  --add_months(b.Data_Scad,1) between (dt_debitare - 60) and dt_debitare   and 
+ currency in ('EUR', 'RON') 
+
+ 
+  ) c   where c.Valuta_Suma = p_currency 
+  group by Cod_furnizor,Nume,CNP,Certificat,IBAN_Client,Nr_factura,Data_emiterii_politei,Valuta_Suma, Data_deb 
+   order by Certificat; --grupare sa adun si rata anterioara.
+ 
+cursor  c_curr is
+with baza as
+ (
+  select 
+             'GPM' as Cod_Furnizor,
+             ppi.name Nume,
+            --ppi.egn  as CNP_client modificat de catre CO in data de 04.10.2017 conform cerinta OTP
+--             case when pcc.policy_id is null then ppi.egn  else pcc.COND_VALUE END as CNP,
+             case when pcc.COND_VALUE is null then ppi.egn  else pcc.COND_VALUE END as CNP,
+             p.policy_no Certificat,
+             p.policy_id,
+             i.pay_way,
+             P.DATE_COVERED Data_Scad, 
+             dt_debitare Data_Deb,
+             pc.cond_value IBAN_Client,
+             ' ' Data_emiterii_politei,
+             ' ' Nr_factura,
+          --   'RO07BTRL01301202925674XX' IBAN_Groupama,
+             currency Valuta_Suma
+from 
+policy p 
+join insureds i on i.policy_id = p.policy_id 
+join p_people ppi on i.man_id = ppi.man_id
+join policy_conditions pd on pd.policy_id = p.policy_id  and pd.cond_type = 'MANDAT_OTP' and pd.cond_dimension ='A'
+join policy_conditions pc on pc.policy_id = p.policy_id and pc.cond_type = 'IBAN_ASIG'
+left join policy_conditions pcc on p.policy_id = pcc.policy_id and  pcc.cond_type =' CNP_OTP'  -- and pcc.cond_dimension =1
+where 
+--p.date_covered between (dt_debitare  - 60) and dt_debitare  and --aflate la scadenta in ultimele 60 de zile
+p.date_covered < P.INSR_END --cover_date<=insr_end.
+and p.insr_type = 5002
+and p.policy_state between 0 and 29 --modificare
+and( p.policy_state <> 11 or p.policy_state_aux <>39)
+ and p.policy_ref  in  (   SELECT  framecontract         FROM usr_cfg_interval_ppi WHERE prefix like 'OTPTMK%')
+--prima rata/ rata cadou
+-- and to_char (p.date_covered,'mmyyyy') > to_char (p.insr_begin,'mmyyyy')     
+ )
+    
+select c.* from ( 
+   select 
+              distinct         currency Valuta_Suma
+  from baza b 
+  join life_prem lp on lp.POLICY_ID = b.policy_id and lp.status = 'V'
+  where b.Data_Scad between LP.BEGIN_DATE and Data_Deb   and currency in ('EUR', 'RON') --data debitare-60<=data scadenta<=data debitare
+  ) c  ; 
+
+
+
+BEGIN
+
+v_start:= to_date(SYSDATE, 'DD-MM-YYYY HH24:MI:SS');
+v_SEQ_ID_FISIER:= SEQ_ID_FISIER.NEXTVAL;
+--dt_debitare:=sysdate;
+--dbms_output.put_line (dt_debitare);
+dt_debitare:=report_date+1;
+
+
+
+if ( zi_lucratoare(dt_debitare) = 1 or to_number(to_char(dt_debitare,'D')) in (1,7)) then
+
+    if(zi_lucratoare(dt_debitare + 1) = 1 or to_number(to_char(dt_debitare +1 ,'D')) in (1,7)) then 
+       if (zi_lucratoare(dt_debitare + 2) = 1 or to_number(to_char(dt_debitare +2 ,'D')) in (1,7)) then 
+          if(zi_lucratoare(dt_debitare + 3) = 1 or to_number(to_char(dt_debitare +3 ,'D')) in (1,7)) then
+            dt_debitare:= dt_debitare + 4;
+            else 
+           dt_debitare:= dt_debitare + 3;
+           end if;
+           else   
+              dt_debitare:=dt_debitare+2; 
+       end if;
+       else 
+          dt_debitare:=dt_debitare+1;
+          end if;
+end if;
+
+V_YEARMMDD:= to_char(to_date(dt_debitare, 'DD-MM-rrrr'),'YYYYMMDD');
+
+
+
+--------------------------------------
+select      ftp_ip,ftp_user,   ftp_pass, db_dir_pol,  db_dir_pol_bk       ,ftp_dir_received||'/', ftp_port ,client_name
+       into  ftp_ip,ftp_user,  ftp_pass,  dir_from ,    db_dir_pol_bk      , ftp_dir_to,                ftp_port ,v_client_name
+ from usr_ppi_clients where client_name = 'OTP';
+ v_file_mask:='DebitareGroupamaGPMTK';
+ 
+ 
+ select 
+            MAIL_TO,
+            MAIL_TO_2,
+            MAIL_ACCOUNT_INFORMARE,
+            MAIL_ACCOUNT_ERORI
+        INTO
+            V_MAIL_TO,
+            V_MAIL_TO_2,
+            V_MAIL_ACCOUNT_INFORMARE,
+            V_MAIL_ACCOUNT_ERORI
+from configurare_ftp where instr(v_file_mask,File_mask)<>0 and rownum=1;
+
+
+update TB_SENT_DD set id16 = 'NEPROCESATA/S-A RULAT ALTA DEBITARE' WHERE ID16 IS NULL;
+
+for C in c_curr loop
+
+l_file_name := v_file_mask ||SUBSTR(C.valuta_suma,1,1)||V_YEARMMDD||'.txt'; -- am creat numele fisierului
+vFile := utl_file.fopen(dir_from ,l_file_name,'w'); --- am deschis fisierul pentru write
+
+---DACA SE GENEREAZA ALTA FISIERE DE DD IAR CELE DEJA GENERATE NU AU APUCAT SA FIE PROCESATE SE INVALIDEAZA PENTRU RASPUNS CELE NEMARCATE 
+
+
+
+for lp_OTP in c_data_otp (C.valuta_suma) loop 
+--SELECT * FROM TB_SENT_DD;
+ INSERT INTO  TB_SENT_DD
+  (ID1,ID2,ID3,ID4,ID5,ID6,ID7,ID8,ID9,ID10,ID11,ID12,ID13,ID14,ID15,ID17)
+  VALUES (SEQ_TB_SENT_DD_OTP.NEXTVAL, lp_OTP.COD_FURNIZOR,lp_OTP.Nume,TO_CHAR(lp_OTP.CNP),lp_OTP.Certificat,lp_OTP.IBAN_CLIENT,lp_OTP.Nr_factura,lp_OTP.Data_emiterii_politei
+                                                                 ,lp_OTP.Prima,lp_OTP.Valuta_Suma,lp_OTP.Data_Deb,l_file_name,'TRIMIS',TO_CHAR (SYSDATE, 'DD-MM-YYYY HH24:MI:SS') ,'OTP',v_SEQ_ID_FISIER);
+   
+   l_line:=    lp_OTP.COD_FURNIZOR || '|' ||
+                  lp_OTP.Nume   || '|' ||
+                  TO_CHAR(lp_OTP.CNP)   || '|' ||
+                  lp_OTP.Certificat   || '|' ||   
+                  lp_OTP.IBAN_CLIENT||'|'||
+                  lp_OTP.Nr_factura||'|'||
+                  lp_OTP.Data_emiterii_politei||'|'||
+                  trim(to_char(lp_OTP.Prima,'999999999.99')) || '|' ||
+                  lp_OTP.Valuta_Suma||'|'||
+                  to_char(lp_OTP.Data_Deb,'DDMMYYYY') || chr(13);
+        
+        utl_file.PUT_LINE(vFile,l_line);
+    end loop;
+    utl_file.fclose(vFile);
+
+
+        l_conn := ftp.login(ftp_ip, ftp_port,ftp_user, ftp_pass);
+            ftp.ascii(p_conn => l_conn);
+            ftp.put(p_conn      => l_conn,
+            p_from_dir  =>dir_from,
+            p_from_file => l_file_name,
+            p_to_file   => ftp_dir_to||l_file_name);
+            
+            
+        ftp.logout(l_conn);    
+utl_file.fgetattr( dir_from, l_file_name, l_exists, l_size, l_block_size ); 
+  
+if   (l_exists) then
+            
+BEGIN        
+v_prefix:= EXTRACT(hour FROM SYSTIMESTAMP)  || EXTRACT(MINUTE FROM SYSTIMESTAMP)  ||to_char(SYSTIMESTAMP,'ss')  || to_char (SYSTIMESTAMP,'ddmmyyyy')||'_' ;
+utl_file.fcopy   (
+                        src_location     =>dir_from,
+                        src_filename  => l_file_name,
+                        dest_location   =>db_dir_pol_bk,
+                        dest_filename => v_prefix|| l_file_name
+                        );
+                        
+    
+                   
+utl_file.fremove
+                ( location     =>dir_from,
+                  filename  => l_file_name
+                  );
+
+  EXCEPTION WHEN UTL_FILE.DELETE_FAILED
+  THEN
+         UTL_MAIL.send(V_MAIL_ACCOUNT_ERORI,V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);
+                PPI_DD_FLUX_FISIERE.LOG_ERROR ( 'DIRECT_DEBIT_OTP',     'VALUE  '||report_date  );
+ 
+                WHEN   UTL_FILE.INVALID_OPERATION THEN
+                     PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||report_date  );
+                           UTL_MAIL.send(V_MAIL_ACCOUNT_ERORI,V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);
+END;
+ 
+-----Informare;
+SELECT COUNT(*) INTO v_rows  FROM TB_SENT_DD WHERE ID17 = v_SEQ_ID_FISIER AND ID12 = l_file_name;
+
+--INSIS_LIFE_BTA.INFORMARE_DD (V_FILE_MASK VARCHAR2,NUME_FISIER VARCHAR2, COMPANIE VARCHAR2,PARAM_2 VARCHAR2, PARAM_3 VARCHAR2, PARAM_4 VARCHAR2)
+PPI_DD_FLUX_FISIERE.INFORMARE_DD (v_file_mask,l_file_name,v_client_name,v_rows, to_char (SYSDATE, 'DD-MM-YYYY HH24:MI:SS') ,v_SEQ_ID_FISIER,1);
+--INSIS_LIFE_BTA.INFORMARE_DD (V_FILE_MASK VARCHAR2,NUME_FISIER VARCHAR2, COMPANIE VARCHAR2,PARAM_2 VARCHAR2, PARAM_3 VARCHAR2, PARAM_4 VARCHAR2)
+
+    ELSE 
+
+PPI_DD_FLUX_FISIERE.INFORMARE_DD (v_file_mask,l_file_name,v_client_name,v_rows, to_char(SYSDATE, 'DD-MM-YYYY HH24:MI:SS') ,null,0);
+
+end if;
+
+end loop;
+
+
+v_end:= to_date(SYSDATE, 'DD-MM-YYYY HH24:MI:SS');
+
+
+INSERT INTO DIRECT_DEBIT_LOG VALUES (V_START,V_END,'DIRECT_DEBIT_OTP');
+COMMIT;
+
+
+EXCEPTION              
+when others  then 
+    --    utl_mail.send('catalin.oprea@groupama.ro', 'catalin.oprea@groupama.ro' ,'catalin.oprea@groupama.ro','catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+-- select  * from  configurare_ftp where file_mask = 'DebitareGroupamaGPMTK';    
+ PPI_DD_FLUX_FISIERE.INFORMARE_DD (v_file_mask,null,v_client_name,null, to_char(SYSDATE, 'DD-MM-YYYY HH24:MI:SS') ,null,0);
+        PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||report_date  ); 
+    
+
+
+
+END DIRECT_DEBIT_OTP;
+
+
+PROCEDURE GENEREAZA_INCASARI_OTP (V_FILE_NAME VARCHAR2,P_MESAJ_PT_GNR VARCHAR2) 
+IS
+   v_inc_name     VARCHAR2 (40);
+   vFile          UTL_FILE.file_type;
+   l_line         VARCHAR2 (400);
+   l_conn         UTL_TCP.connection;
+--   v_file_name    VARCHAR2 (50):='20171101_CONFTMKRON_GPM.txt';
+   v_inc_name     VARCHAR2 (8);
+   v_open_month   VARCHAR2 (8);
+   v_nr_tb number;
+   v_nr_importate number;
+   l_file_name varchar2(60);    
+   V_FILE_MASK             CONFIGURARE_FTP.FILE_MASK%TYPE;
+   V_EXTENSIE              CONFIGURARE_FTP.EXTENSIE%TYPE;
+   V_FTP_LOCATION          CONFIGURARE_FTP.FTP_LOCATION%TYPE;
+   V_FTP_LOCATION_BACKUP   CONFIGURARE_FTP.FTP_LOCATION_BACKUP%TYPE;
+   V_DIR_LOCAL             CONFIGURARE_FTP.DIR_LOCAL%TYPE;
+   V_DIR_LOCAL_BACKUP      CONFIGURARE_FTP.DIR_LOCAL_BACKUP%TYPE;
+--   V_ID                    CONFIGURARE_FTP.SEQ_ID_INCASARI_FTP%TYPE := 1;
+   V_FTP_IP                CONFIGURARE_FTP.FTP_IP%TYPE;
+   V_FTP_PORT              CONFIGURARE_FTP.FTP_PORT%TYPE;
+   V_FTP_USER              CONFIGURARE_FTP.FTP_USER%TYPE;
+   V_FTP_PASSWORD          CONFIGURARE_FTP.FTP_PASSWORD%TYPE;
+   V_FLUX_IMPORT                 CONFIGURARE_FTP.FLUX_IMPORT%TYPE;
+   V_DELIMITATOR    CONFIGURARE_FTP.DELIMITATOR%TYPE;
+   V_MAIL_TO           CONFIGURARE_FTP.MAIL_TO%TYPE;
+   V_MAIL_TO_2           CONFIGURARE_FTP.MAIL_TO_2%TYPE;
+   V_MAIL_ACCOUNT_INFORMARE           CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE %TYPE;
+   V_MAIL_ACCOUNT_ERORI       CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+   V_PREFIX                VARCHAR (20);
+   V_PREFIX_file                VARCHAR (20);
+   v_max_id_file number;
+   v_fisiere_generate varchar(400);
+   v_linii_generate number;
+   v_mail_msg varchar(2000);
+    --AICI IAU DIN TABELA DE CONFIG
+--    ftp_ip varchar(12);
+--    ftp_user varchar(15);
+--    ftp_pass varchar (20);
+--    dir_from varchar(20);
+--    ftp_dir_to varchar (20);
+--    ftp_port number;
+
+   --CURSOR GRUPAT   iau numele fisierului din parametru 
+   CURSOR C_HEADER (
+      v_file_name VARCHAR2)
+   IS
+      WITH BAZA
+           AS (  SELECT SUM (suma) SUMA,
+                        CASE
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'R' THEN 'RON'
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'E' THEN 'EUR'
+                        END
+                           AS MONEDA,
+                        AGE.agent_no,
+                        CASE
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'R'
+                           THEN
+                              '5441OTPTMK'
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'E'
+                           THEN
+                              '5443OTPTMK'
+                        END
+                           AS CONT 
+                   FROM RASPUNS_DD_OTP RAS
+                        INNER JOIN POLICY P
+                           ON RAS.NUMAR_POLICY = P.POLICY_NO
+                        INNER JOIN p_agents age
+                           ON P.AGENT_ID = age.agent_id
+                  WHERE from_file = v_file_name 
+                        AND valuta =
+                               CASE
+                                  WHEN SUBSTR (FROM_FILE, 17, 1) = 'R'
+                                  THEN
+                                     'RON'
+                                  WHEN SUBSTR (FROM_FILE, 17, 1) = 'E'
+                                  THEN
+                                     'EUR'
+                               END
+                            AND   GENERARE_INCASARI<>'Generata' 
+               GROUP BY AGE.agent_no,
+                        CASE
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'R' THEN 'RON'
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'E' THEN 'EUR'
+                        END,
+                        CASE
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'R'
+                           THEN
+                              '5441OTPTMK'
+                           WHEN SUBSTR (FROM_FILE, 17, 1) = 'E'
+                           THEN
+                              '5443OTPTMK'
+                        END)
+      SELECT *
+        FROM BAZA;
+
+
+   --CURSOR DETALIAT CU PARAMETRU AGENTII DIN FISIER 
+
+   CURSOR C_DETALIAT (
+      c_agent_no     VARCHAR2,
+      v_file_name    VARCHAR2)
+   IS
+      WITH dt_baza
+           AS (SELECT AGE.agent_no,case when suma <=userexit_printout.get_prem_curr (p.policy_id) then suma  else suma/2  end as Suma,RAS.NUMAR_POLICY as NUMAR_POLICY_tb 
+                 FROM RASPUNS_DD_OTP RAS
+                      INNER JOIN POLICY P
+                         ON RAS.NUMAR_POLICY = P.POLICY_NO
+                      INNER JOIN p_agents age
+                         ON P.AGENT_ID = age.agent_id
+                WHERE FROM_FILE = v_file_name AND age.agent_no = c_agent_no
+                 AND   GENERARE_INCASARI<>'Generata' 
+                      AND valuta =
+                             CASE
+                                WHEN SUBSTR (FROM_FILE, 17, 1) = 'R'
+                                THEN
+                                   'RON'
+                                WHEN SUBSTR (FROM_FILE, 17, 1) = 'E'
+                                THEN
+                                   'EUR'
+                             END
+--                    and  <=ras.suma         
+union all
+        ---Pentru lina a 2-a
+        /*De asemenea pt fiecare inregistrare din fisierul OTP se face o verificare a primei din INSIS pe acea polita folosindu-se functia “userexit_printout.get_prem_curr” 
+        (ex: select userexit_printout.get_prem_curr(102000132538) from dual). Daca valoarea primei incasate din fisierul OTP 
+        pt o anumita polita este >valoarea primei intoarse de functia de calcul prima, in fisierul de incasare Groupama se vor genera 2 inregistrari pt respectiva polita, iar in campul de prima se va insera valoarea primei din fisierul OTP impartita la 2.*/
+     SELECT AGE.agent_no, case when suma <=userexit_printout.get_prem_curr (p.policy_id) then suma  else suma/2  end as Suma,RAS.NUMAR_POLICY as NUMAR_POLICY_tb 
+                 FROM RASPUNS_DD_OTP RAS
+                      INNER JOIN POLICY P
+                         ON RAS.NUMAR_POLICY = P.POLICY_NO
+                      INNER JOIN p_agents age
+                         ON P.AGENT_ID = age.agent_id
+                WHERE FROM_FILE = v_file_name AND age.agent_no = c_agent_no
+                 AND   GENERARE_INCASARI<>'Generata' 
+                      AND valuta =
+                             CASE
+                                WHEN SUBSTR (FROM_FILE, 17, 1) = 'R'
+                                THEN
+                                   'RON'
+                                WHEN SUBSTR (FROM_FILE, 17, 1) = 'E'
+                                THEN
+                                   'EUR'
+                             END
+                  and  suma > userexit_printout.get_prem_curr (p.policy_id)   
+                             )
+      SELECT *
+        FROM dt_baza;
+BEGIN
+
+   v_nr_importate:=0;
+--select * from usr_ppi_clients
+   SELECT FILE_MASK,
+          EXTENSIE,
+          FTP_LOCATION,
+          FTP_LOCATION_BACKUP,
+          DIR_LOCAL,
+          DIR_LOCAL_BACKUP,
+          FTP_IP,
+          FTP_PORT,
+          FTP_USER,
+          FTP_PASSWORD,
+          FLUX_IMPORT,
+         DELIMITATOR,
+         MAIL_TO,           
+         MAIL_TO_2,
+         MAIL_ACCOUNT_INFORMARE,
+         MAIL_ACCOUNT_ERORI  
+     INTO V_FILE_MASK,  
+          V_EXTENSIE,
+          V_FTP_LOCATION,
+          V_FTP_LOCATION_BACKUP,
+          V_DIR_LOCAL,
+          V_DIR_LOCAL_BACKUP,
+          V_FTP_IP,
+          V_FTP_PORT,
+          V_FTP_USER,
+          V_FTP_PASSWORD,
+          V_FLUX_IMPORT,
+          V_DELIMITATOR,
+          V_MAIL_TO,        
+          V_MAIL_TO_2,
+          V_MAIL_ACCOUNT_INFORMARE,
+          V_MAIL_ACCOUNT_ERORI  
+     FROM CONFIGURARE_FTP
+    WHERE mask_br = 'INC_CODAGENT1_'|| SUBSTR (v_file_name, 17, 3)||'_ddmmyyyy.txt' ;
+    
+
+--select DELIMITATOR  into  V_DELIMITATOR 
+--from configurare_ftp where mask_br ='INC_CODAGENT1_RON_ddmmyyyy.txt';
+
+select  count(*) 
+ into  v_nr_tb
+from raspuns_dd_otp where V_FILE_NAME = FROM_FILE and  NVL(GENERARE_INCASARI,'0') <>'Generata' ;
+
+IF v_nr_tb<>0 
+THEN
+
+   SELECT YEAR || TO_CHAR (TO_DATE (MONTH, 'MM'), 'MM'),
+          SUBSTR (v_file_name, 1, 8)
+     INTO  v_open_month,V_PREFIX_file
+     FROM SYSTEM_PERIODS
+    WHERE STATUS = 'OPEN';
+    
+--    dbms_output.put_line ('V_PREFIX_file = '||V_PREFIX_file || ' '||v_open_month  );
+
+   IF V_PREFIX_file < v_open_month
+   THEN
+
+       SELECT   '01.' || TO_CHAR (TO_DATE (MONTH, 'MM'), 'MM') || '.' || YEAR  INTO       V_PREFIX_file  FROM system_periods where status = 'OPEN';
+       
+   ELSE
+      --substr(v_prefix,6,2) ||'.'|| substr (v_prefix,4,4)||'.'||substr (v_prefix,1,2);
+      V_PREFIX_file :=
+            SUBSTR (V_PREFIX_file, 7, 2)
+         || '.'
+         || SUBSTR (V_PREFIX_file, 5, 2)
+         || '.'
+         || SUBSTR (V_PREFIX_file, 1, 4);
+   END IF;
+
+v_fisiere_generate:='';
+   --- tabela config sa pun unde se duce dupa maskul INC_CODAGENT_RO si INC_CODAGENT_EUR
+   --- parametrii din tabela
+   --deschid sesiunea catre FTP
+   l_conn :=
+      ftp.login ( V_ftp_ip,
+                     V_ftp_port,
+                     V_ftp_user,
+                     V_FTP_PASSWORD);
+-- dbms_output.put_line ('conexiune catre  ftp');
+
+     v_fisiere_generate:=  'Fisiere incasari : ';
+     
+   FOR dd_header IN C_HEADER (v_file_name)
+   LOOP
+   v_linii_generate:=0;
+   
+      --- FOR CURSOR IN HEADER
+      --IF SUBSTR  YYYYMM = YYYYMM DE NUMELE FISIERULUI ATUNCI PASTREZ DATA NUME FISIER ELSE IAU 01.MONTH OPEN YEAR OPEN IN v_inc_name
+      l_file_name :=
+            'INC_'
+         || dd_header.agent_no
+         || '_'
+         || dd_header.MONEDA
+         || '_'
+         || V_PREFIX_file
+         || v_extensie; -- am creat numele fisierului pot sa-i dau din fisisrul de config extensia
+-- dbms_output.put_line (l_file_name);
+        v_fisiere_generate:=v_fisiere_generate||CHR(10)||' Nume Fisier:  '||l_file_name ||CHR(10)||' Numarul de linii: ';
+--        dbms_output.put_line(v_fisiere_generate);
+        vFile := UTL_FILE.fopen (V_DIR_LOCAL, l_file_name, 'w');
+      --linia
+      l_line :=
+            V_PREFIX_file
+         || V_DELIMITATOR
+         || dd_header.SUMA
+         || V_DELIMITATOR
+         || dd_header.MONEDA
+         || V_DELIMITATOR
+         || dd_header.CONT;
+      UTL_FILE.PUT_LINE (vFile, l_line);
+--             dbms_output.put_line (l_line);
+
+--      FOR CURSOR IN DETALIAT  CU PARAMETRU COD AGENT
+      FOR dd_detaliat IN C_DETALIAT ( dd_header.agent_no,v_file_name)
+      LOOP
+         v_nr_importate:=   v_nr_importate+1;
+         v_linii_generate:=  v_linii_generate+1;
+         
+         l_line :=
+               dd_detaliat.NUMAR_POLICY_tb
+            || V_DELIMITATOR
+            || dd_detaliat.suma
+            || V_DELIMITATOR
+            || V_PREFIX_file
+            || CHR (13);
+         UTL_FILE.PUT_LINE (vFile, l_line);
+--         dbms_output.put_line (l_line);---aici avem o singura polita per fisier. Aici avem fisierul din import obtinut din procedura de import_otp
+         update raspuns_dd_otp otp set generare_incasari ='Generata' where dd_detaliat.NUMAR_POLICY_tb = otp.NUMAR_POLICY AND FROM_FILE = V_FILE_NAME;
+      --END CURSOR DETALIAT
+      END LOOP;
+--
+    v_fisiere_generate :=v_fisiere_generate|| ' '||v_linii_generate||CHR(10);
+--inchid fisierul
+      UTL_FILE.fclose (vFile);
+      
+   -----aici il urc pe ftp
+      
+      ftp.ASCII (p_conn => l_conn);
+
+      ftp.put (p_conn      => l_conn,
+               p_from_dir   => V_DIR_LOCAL,
+               p_from_file   => l_file_name,
+               p_to_file       => V_FTP_LOCATION || l_file_name);
+---il mut in arhiva pe local
+      v_prefix :=
+            EXTRACT (HOUR FROM SYSTIMESTAMP)
+         || EXTRACT (MINUTE FROM SYSTIMESTAMP)
+         || TO_CHAR (SYSTIMESTAMP, 'ss')
+         || TO_CHAR (SYSTIMESTAMP, 'ddmmyyyy')
+         || '_';
+
+   UTL_FILE.fcopy (src_location    => V_DIR_LOCAL,
+                      src_filename    => l_file_name,
+                      dest_location   => V_DIR_LOCAL_BACKUP,
+                      dest_filename   => v_prefix || l_file_name);
+     
+   UTL_FILE.FREMOVE (
+                                 V_DIR_LOCAL,
+                                 l_file_name);
+                                 
+    
+--   ftp.rename (
+--      p_conn   => l_conn,
+--      p_from   => V_FTP_LOCATION || l_file_name,
+--      p_to       => V_FTP_LOCATION_BACKUP || v_prefix || l_file_name);     
+              
+--      select * from configurare_ftp
+--      
+--      UTL_FILE.fremove (location => V_DIR_LOCAL, filename => l_file_name);
+      select max(id)+1 into v_max_id_file from USR_PPI_PAYMENT_FILES;
+                insert into USR_PPI_PAYMENT_FILES (ID, FILE_NAME, STATE, FILE_ID, CHECK_FILE, FTP_LOAD_STATE)
+                    values (v_max_id_file,l_file_name, '' , null, 1, null);
+
+       COMMIT;
+
+        PPI_DD_FLUX_FISIERE.PPI_PAYMENT_UPLOAD_CHECK_autom (v_max_id_file,V_MAIL_ACCOUNT_INFORMARE,V_MAIL_ACCOUNT_ERORI,V_MAIL_TO, V_MAIL_TO_2);
+   ---mut fisierul in backup-ul de pe ftp pe ftp backup dupa ce procedura de mai sus  PPI_PAYMENT_UPLOAD_CHECK_autom l-a mutat pe local si procesat
+             ftp.rename (
+                             p_conn   => l_conn,
+                             p_from   => V_FTP_LOCATION || l_file_name,
+                             p_to       => V_FTP_LOCATION_BACKUP || v_prefix || l_file_name);
+
+   ---END CURSOR  GRUPARE
+   END LOOP;
+   --inchid conexiunea catre FTP
+ftp.LOGOUT (l_conn);
+
+if    v_nr_importate>=v_nr_tb then 
+v_mail_msg:=P_MESAJ_PT_GNR ||CHR(10)||' Procedura de generare incasari a fost rulata  cu succes! Fisier prelucrat :' ||V_FILE_NAME||' Linii fisier:'||v_nr_tb ||' Linii incasari '||v_nr_importate||'.'||CHR(10)||v_fisiere_generate;
+utl_mail.send(V_MAIL_ACCOUNT_INFORMARE, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Succes',v_mail_msg, NULL); 
+else 
+v_mail_msg:=P_MESAJ_PT_GNR||' Fisier prelucrat :'||l_file_name||'! Numarul de linii importate este '||v_nr_tb||' ,numarul de incasari generate  este '|| v_nr_importate||'.Numarul de incasari generate nu trebuie sa fie mai mic decat numarul de linii importate.'||CHR(10)||v_fisiere_generate;
+
+        utl_mail.send(V_MAIL_ACCOUNT_ERORI,V_MAIL_TO ,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Diferente generare incasari',v_mail_msg, NULL);  
+           
+
+end if;
+else null;
+end if;
+--COMMENTAT VINERI
+EXCEPTION WHEN OTHERS THEN
+   ftp.LOGOUT (l_conn);
+     PPI_DD_FLUX_FISIERE.LOG_ERROR (     'GENEREAZA_INCASARI_OTP',     'VALUE  '||V_FILE_NAME  ); 
+         utl_mail.send(V_MAIL_ACCOUNT_ERORI,V_MAIL_TO ,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail',' A aparut o eroare la procedura generare incasari!Verificati ERROR_LOG', NULL);  
+--           
+
+
+END GENEREAZA_INCASARI_OTP;
+
+
+
+PROCEDURE IMPORT_FISIERE_OTP (V_ID NUMBER)
+IS
+--DECLARE 
+   l_conn               UTL_TCP.connection;
+   l_list                  ftp.t_string_table;
+   V1                      VARCHAR (2000);
+   F1                      UTL_FILE.FILE_TYPE;
+   V_FILE_MASK             CONFIGURARE_FTP.FILE_MASK%TYPE;
+   V_EXTENSIE              CONFIGURARE_FTP.EXTENSIE%TYPE;
+   V_FTP_LOCATION          CONFIGURARE_FTP.FTP_LOCATION%TYPE;
+   V_FTP_LOCATION_BACKUP   CONFIGURARE_FTP.FTP_LOCATION_BACKUP%TYPE;
+   V_DIR_LOCAL             CONFIGURARE_FTP.DIR_LOCAL%TYPE;
+   V_DIR_LOCAL_BACKUP      CONFIGURARE_FTP.DIR_LOCAL_BACKUP%TYPE;
+--   V_ID                    CONFIGURARE_FTP.SEQ_ID_INCASARI_FTP%TYPE := 1;  --select * from configurare_ftp;
+   V_FTP_IP                CONFIGURARE_FTP.FTP_IP%TYPE;
+   V_FTP_PORT              CONFIGURARE_FTP.FTP_PORT%TYPE;
+   V_FTP_USER              CONFIGURARE_FTP.FTP_USER%TYPE;
+   V_FTP_PASSWORD          CONFIGURARE_FTP.FTP_PASSWORD%TYPE;
+   V_FLUX_IMPORT           CONFIGURARE_FTP.FLUX_IMPORT%TYPE;
+   V_MAIL_TO           CONFIGURARE_FTP.MAIL_TO%TYPE;
+   V_MAIL_TO_2           CONFIGURARE_FTP.MAIL_TO_2%TYPE;
+   V_MAIL_ACCOUNT_INFORMARE           CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE %TYPE;
+   V_MAIL_ACCOUNT_ERORI       CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+   V_FILE_NAME             VARCHAR (30);
+   V_PREFIX                VARCHAR (20);
+   V_CONTOR                NUMBER;
+   l_block_size            NUMBER;
+   l_exists                BOOLEAN;
+   l_size                  NUMBER;
+   report_date             DATE := SYSDATE;
+   V_START                 DATE;
+   V_END                   DATE;
+   v_comanda               VARCHAR2 (50);
+   V_COMPANIE_CONTRACT VARCHAR2 (50);
+   V_DELIMITATOR           VARCHAR (5);
+   v_randuri_fisier        NUMBER;
+   v_randuri_importate     NUMBER;
+   V_MESAJ_PT_GNR VARCHAR(300);
+
+   CURSOR sql_dyn
+   IS
+      WITH sql_str AS (SELECT * FROM Tb_Buffer_File)
+      SELECT *
+        FROM sql_str;
+
+  CURSOR F_TRANSF 
+  IS
+            WITH F_TRAN AS (SELECT * FROM FISIERE_TRANSFER)
+            SELECT *
+              FROM F_TRAN;
+--CONFIG              CONFIGURARE_FTP%ROWTYPE;
+
+BEGIN
+   --TRAG DATELE DIN TABELA DE CONFIG
+   SELECT FILE_MASK,
+          EXTENSIE,
+          FTP_LOCATION,
+          FTP_LOCATION_BACKUP,
+          DIR_LOCAL,
+          DIR_LOCAL_BACKUP,
+          FTP_IP,
+          FTP_PORT,
+          FTP_USER,
+          FTP_PASSWORD,
+          FLUX_IMPORT,
+          DELIMITATOR,
+          COMPANIE_CONTRACT,
+          MAIL_TO,
+          MAIL_TO_2,
+          MAIL_ACCOUNT_INFORMARE,
+          MAIL_ACCOUNT_ERORI          
+     INTO V_FILE_MASK,
+          V_EXTENSIE,
+          V_FTP_LOCATION,
+          V_FTP_LOCATION_BACKUP,
+          V_DIR_LOCAL,
+          V_DIR_LOCAL_BACKUP,
+          V_FTP_IP,
+          V_FTP_PORT,
+          V_FTP_USER,
+          V_FTP_PASSWORD,
+          V_FLUX_IMPORT,
+          V_DELIMITATOR,
+          V_COMPANIE_CONTRACT,
+          V_MAIL_TO,
+          V_MAIL_TO_2,
+          V_MAIL_ACCOUNT_INFORMARE,
+          V_MAIL_ACCOUNT_ERORI          
+     FROM CONFIGURARE_FTP
+    WHERE SEQ_ID_INCASARI_FTP = V_ID;
+
+   --update  CONFIGURARE_FTP set ftp_location = 'GROM_LIFE/', ftp_location_backup ='GROM_LIFE/BACKUP/'
+   --commit;
+
+   ---MA CONECTEZ LA FTP
+   l_conn :=
+      ftp.login (V_FTP_IP,
+                 V_FTP_PORT,
+                 V_FTP_USER,
+                 V_FTP_PASSWORD);
+
+   ---LISTEZ FISIERLE DE PE FTP SI LE INTRODUC IN TABLE FISIERE_TRANSFER
+   ftp.nlst (p_conn => l_conn, p_dir => V_FTP_LOCATION, p_list => l_list);
+
+
+
+   IF l_list.COUNT > 0
+   THEN
+      EXECUTE IMMEDIATE 'TRUNCATE TABLE FISIERE_TRANSFER';
+
+      FOR i IN l_list.FIRST .. l_list.LAST
+      LOOP
+         INSERT INTO FISIERE_TRANSFER
+              VALUES (l_list (i));
+
+--         DBMS_OUTPUT.put_line ('FISIERUL ESTE: ' || l_list (I));
+--         DBMS_OUTPUT.put_line (
+--            'FILE MASKUL ESTE' || V_FILE_MASK || V_EXTENSIE);
+      END LOOP;
+
+      ----STERG FISIERELE CARE NU AU MASKUL CARE TREBUIE
+
+      EXECUTE IMMEDIATE
+            'delete from FISIERE_TRANSFER where upper(mesaj) not like ''%'
+         || UPPER (V_FILE_MASK || V_EXTENSIE)
+         || '%''';
+
+      --
+      --STERG CALEA CA SA AM NUMELE FISIERULUI
+      EXECUTE IMMEDIATE
+            'update FISIERE_TRANSFER set mesaj = replace  (mesaj,'''
+         || V_FTP_LOCATION
+         || ''','''')';
+   END IF;
+
+
+   --SA PRESUPUNEM CA AVEM UN SINGUR FISIER PE MASK. TREBUIE VAZUT CUM ESTE LA BT SI SE POATE FACE CURSOR
+   --select * from FISIERE_TRANSFER
+   SELECT COUNT (*) INTO V_CONTOR FROM FISIERE_TRANSFER;
+
+   ---Daca exista fisiere cu maskul respectiv atunci le trec prin cursor
+   IF V_CONTOR >= 1
+   THEN
+         FOR C_TRANSF IN F_TRANSF 
+                       LOOP
+                    --      SELECT MESAJ INTO V_FILE_NAME FROM FISIERE_TRANSFER where rownum =1; 
+                        V_FILE_NAME:=c_transf.mesaj;
+                    --      DBMS_OUTPUT.put_line ('V_FILE_NAME:=' || V_FILE_NAME);
+                          --dbms_output.put_line ('V_FTP_LOCATION: ' || V_FTP_LOCATION ||'/V_DIR_LOCAL cu V_FILE_NAME ' ||   '/'||V_DIR_LOCAL||V_FILE_NAME || '  V_FILE_NAME: '||V_FILE_NAME);
+                          --ADUC FISIERUL PE LOCAL
+                          ftp.get (p_conn        => l_conn,
+                                   p_from_file   => V_FTP_LOCATION || V_FILE_NAME, ---aduc csv-ul de pe ftp pe local -- trebuie sa tin cont e case sensitive
+                                   p_to_dir      => V_DIR_LOCAL,
+                                   p_to_file     => V_FILE_NAME);
+
+                          ---Mut fisierul in arhiva pe ftp
+                          --1.1  Prefixez
+                          v_prefix :=
+                                EXTRACT (HOUR FROM SYSTIMESTAMP)
+                             || EXTRACT (MINUTE FROM SYSTIMESTAMP)
+                             || TO_CHAR (SYSTIMESTAMP, 'ss')
+                             || TO_CHAR (SYSTIMESTAMP, 'ddmmyyyy')
+                             || '_';
+                          --1.2  Mut
+                          ftp.rename (
+                             p_conn   => l_conn,
+                             p_from   => V_FTP_LOCATION || V_FILE_NAME,
+                             p_to     => V_FTP_LOCATION_BACKUP || v_prefix || V_FILE_NAME);
+  
+
+                       ---Verific ca fisierul a ajuns pe local
+                       UTL_FILE.fgetattr (V_DIR_LOCAL,
+                                          V_FILE_NAME,
+                                          l_exists,
+                                          l_size,
+                                          l_block_size);
+
+
+
+                       IF (l_exists)
+                       THEN
+                          EXECUTE IMMEDIATE 'TRUNCATE TABLE Tb_Buffer_File';
+
+                          v_randuri_fisier := 0;
+                          -----2.Incep importul fisierului de pe local
+                          --Deschid fisierul pentru citire
+                          f1 :=
+                             UTL_FILE.fopen (V_DIR_LOCAL,
+                                                     V_FILE_NAME,
+                                                     'r',
+                                                     32767);
+
+                          --- Il parcurg numeric or value error: character string buffer too small
+                          LOOP
+                             BEGIN
+                                UTL_FILE.GET_LINE (F1, V1);                           ---iau linia
+
+                                INSERT INTO Tb_Buffer_File
+                                     VALUES (v1);                              --inserez in tabela
+
+                                v_randuri_fisier := v_randuri_fisier + 1;
+
+                                COMMIT;
+                             EXCEPTION
+                                WHEN NO_DATA_FOUND
+                                THEN
+                                   EXIT;
+                                WHEN OTHERS
+                                THEN
+                                   PPI_DD_FLUX_FISIERE.LOG_ERROR ('INCARCA_FISIERE', 'VALUE  ' || V_ID);
+                             END;
+                          END LOOP;
+
+                          IF UTL_FILE.IS_OPEN (F1)
+                          THEN
+                    --         DBMS_OUTPUT.put_line ('File is Open');
+                             UTL_FILE.FCLOSE (F1);   --inchid fisierul daca este deschis pt citire
+                          END IF;
+
+                          --
+                          v_randuri_importate := 0;
+
+                          FOR c_cursor IN sql_dyn
+                          LOOP
+                             v_randuri_importate := v_randuri_importate + 1;
+                             --dbms_output.put_line (c_cursor.mesaj);
+                             SP_INSERT_RASP_OTP (V_FILE_NAME,
+                                                 V_ID,
+                                                 c_cursor.File_Line,
+                                                 V_DELIMITATOR,
+                                                 V_MAIL_TO,
+                                                 V_MAIL_TO_2,
+                                                 V_MAIL_ACCOUNT_ERORI);
+                          END LOOP;
+
+                          IF v_randuri_importate <> v_randuri_fisier
+                          THEN
+                    --         DBMS_OUTPUT.put_line (
+                           
+                    --            'Din fisierul '
+                    --            || V_FILE_NAME
+                    --            || 's-au importat '
+                    --            || v_randuri_importate
+                    --            || 'din '
+                    --            || v_randuri_fisier);
+                             ---Mesaj de eroare
+                              utl_mail.send(V_MAIL_ACCOUNT_INFORMARE,V_MAIL_TO ,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Eroare la import.',  'Din fisierul '
+                                || V_FILE_NAME
+                                || 's-au importat '
+                                || v_randuri_importate
+                                || 'din '
+                                || v_randuri_fisier, NULL);  
+                                        
+                          ELSE
+                          --Informare pentru succes
+                          V_MESAJ_PT_GNR:='A fost importat fisierul '||V_FILE_NAME ||' pentru compania '||V_COMPANIE_CONTRACT||'. '||CHR(10)||'Numarul de linii importate: '|| v_randuri_importate||'.'||CHR(10)||'Fisierul a fost importat la ora: '||to_char(SYSDATE, 'DD-MM-YYYY HH24:MI:SS')||CHR(10) ;
+                                        --COMENTAT VINERI
+--                                           PPI_DD_FLUX_FISIERE.INFORMARE_DD (V_FILE_MASK , V_FILE_NAME,V_COMPANIE_CONTRACT,v_randuri_importate,  to_char(SYSDATE, 'DD-MM-YYYY HH24:MI:SS'),NULL,1);
+                          END IF;
+                        
+                     --STERG FISIERUL DE PE LOCAL
+                        UTL_FILE.FREMOVE (
+                                 V_DIR_LOCAL,
+                                 V_FILE_NAME);
+                       END IF;
+
+
+                       SELECT FLUX_IMPORT
+                         INTO v_comanda
+                         FROM configurare_ftp
+                        WHERE INSTR (V_FILE_NAME, FILE_MASK, 1) <> 0;
+                        ----Daca trebuie sa genereze incasari cond v_comanda = CONFIRMATA ATUNCI EXECUTA PROCEDURA DE GENERARE
+
+                                   IF (v_comanda = 'CONFIRMATA')
+                                   THEN
+                                      PPI_DD_FLUX_FISIERE.GENEREAZA_INCASARI_OTP (v_file_name,V_MESAJ_PT_GNR);
+                                      ELSE 
+                                         PPI_DD_FLUX_FISIERE.INFORMARE_DD (V_FILE_MASK , V_FILE_NAME,V_COMPANIE_CONTRACT,v_randuri_importate,  to_char(SYSDATE, 'DD-MM-YYYY HH24:MI:SS'),NULL,1);
+                                   END IF;
+                       END LOOP;
+    END IF ;
+
+ --Inchid conexiunea cu FTP-ul
+   ftp.LOGOUT (l_conn);
+ --COMMENTAT VINERI  
+EXCEPTION
+   WHEN OTHERS
+   THEN
+     PPI_DD_FLUX_FISIERE.LOG_ERROR (     'IMPORT_FISIERE_OTP',     'VALUE  '||V_FILE_NAME  ); 
+      ftp.LOGOUT (l_conn);
+--      DBMS_OUTPUT.put_line (SQLERRM);
+      UTL_MAIL.SEND(V_MAIL_ACCOUNT_ERORI, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Eroare la import.',            'Eroare la importul fisierului '||v_file_name ||'.'||SQLERRM, NULL);  
+      
+END IMPORT_FISIERE_OTP;
+
+
+procedure Load_direct_debit_OTP(report_date date default sysdate) as-- report_date = sysdate
+---Preluat de la INSIS_LIFE_BTA.load_direct_debit_BT
+   w_day number := to_number(to_char(report_date,'D'));
+BEGIN
+
+
+if (zi_lucratoare(report_date) = 0 and w_day not in (1,7)) then --verifica ziua sa nu fie in [duminica, sambata]   si ca ziua este lucratoare 
+
+   if (w_day = 6)   then  ---este vineri si e lucratoare (conditia de lucratoare la punctul 1 exec)
+     --   executie functie cu report_date
+    PPI_DD_FLUX_FISIERE.DIRECT_DEBIT_OTP(report_date,null);
+
+    elsif (zi_lucratoare(report_date + (6 - w_day))  = 1 ) then ---daca vineri e nelucratoare 
+    if ((w_day = 4 and zi_lucratoare(report_date + (5 - w_day))  = 1) or (w_day = 5)) then  --- miercuri e lucratoare , joi este nelucratoare si vineri este nelucratoare sau vineri este nelucratoare si joi este lucreatoare
+
+    PPI_DD_FLUX_FISIERE.DIRECT_DEBIT_OTP(report_date,null);-- executa cu ziua de joi;
+    end if;
+
+    else null;-- nu face nimic-- vineri din saptamana respectiva este zi lucratoare;
+
+   end if;
+
+end if;
+
+ END load_direct_debit_OTP;
+ 
+ 
+ PROCEDURE LOAD_FIS_CLI_COMIS_OTP ( report_date DATE default sysdate)
+AS                                                    
+   -- report_date date:='04-dec-2017';
+   m_day   DATE;
+BEGIN
+   m_day := TRUNC ( (report_date), 'month');
+
+   ---daca este prima zi lucratoare
+   dbms_output.put_line (m_day);
+   IF (trunc(CALCUL_ZI_LUCRATOARE (m_day, 1)) = trunc(report_date))
+   THEN
+      --ruleaza procedurile
+--             dbms_output.put_line ('Se ruleaza procedurile');
+      PPI_DD_FLUX_FISIERE.OTP_FISIER_CLIENTI (report_date);
+      PPI_DD_FLUX_FISIERE.OTP_BORDEROU_COMISION (report_date);
+   ELSE
+      -- altfel nu fac nimic
+--       dbms_output.put_line ('ziua nu este prima zi lucratoare din luna ');
+      NULL;
+   END IF;
+END LOAD_FIS_CLI_COMIS_OTP;
+
+PROCEDURE OTP_BORDEROU_COMISION (DATA_RAPORT DATE,   PROCENT_COMISION INT DEFAULT 20) AS 
+--declare 
+   dt_debitare   DATE;
+   l_file_name   VARCHAR2 (60);
+   vFile         UTL_FILE.file_type;
+   l_conn  UTL_TCP.connection;
+   l_line        VARCHAR2 (4000);
+   ftp_ip        VARCHAR (12);
+   ftp_user      VARCHAR (15);
+   ftp_pass      VARCHAR (20);
+   dir_from      VARCHAR (20);
+   ftp_dir_to    VARCHAR (20);
+   ftp_port      NUMBER;
+   v_start date;
+   v_end date;
+   db_dir_pol_bk varchar2 (30);
+   v_prefix varchar2(15);
+   v_err varchar2(2000);
+    V_MAIL_TO           CONFIGURARE_FTP.MAIL_TO%TYPE;
+    V_MAIL_TO_2       CONFIGURARE_FTP.MAIL_TO_2%TYPE;
+    V_MAIL_ACCOUNT_INFORMARE           CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE %TYPE;
+    V_MAIL_ACCOUNT_ERORI       CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+--    DATA_RAPORT DATE:= '2-oct-2017';
+--    Procent_comision int:=20;
+
+CURSOR CURSOR_INCASARI 
+
+IS
+
+select  
+            ppi.egn CNP,
+            ppi.name Nume,
+            p.policy_no,
+            OP_amount,
+            inst.voucher_date, 
+            i.currency moneda,
+            (Procent_comision/100) *OP_amount as Comision
+from policy p 
+join insureds i on i.policy_id = p.policy_id ---asigurati 
+join p_people ppi on i.man_id = ppi.man_id
+join policy_conditions pc on pc.policy_id = p.policy_id and pc.cond_type = 'MANDAT_OTP' and pc.cond_dimension ='A'
+join policy_conditions pc on pc.policy_id = p.policy_id and pc.cond_type = 'IBAN_ASIG'
+inner join install_doc inst on p.policy_id = inst.policy_id 
+join life_instalments lp on lp.POLICY_ID = p.policy_id and lp.install_id =inst.install_id --and   to_char (lp.old_covered ,'MMYYYY') <>to_char(p.insr_begin,'MMYYYY')
+join
+(
+select p.policy_id,sum(OP_amount ) OP_amount ,reference_id,account_date  from  policy p 
+        inner join  gl_insis2gl g on p.policy_ref in  (   SELECT  framecontract         FROM usr_cfg_interval_ppi WHERE prefix like 'OTPTMK%') and p.policy_id = g.policy_id
+where account_date  BETWEEN TRUNC (ADD_MONTHS (dt_debitare,-1),'month')    AND LAST_DAY (add_months(dt_debitare,-1))
+and dt_account='PSA' and ct_account like 'PR%'
+        group by reference_id ,p.policy_id,account_date) gl on inst.install_id = gl.reference_id  and gl.account_date  BETWEEN TRUNC (ADD_MONTHS (dt_debitare,-1),'month')    AND LAST_DAY (add_months(dt_debitare,-1))
+where not (inst.install_state =2 and install_type =2) ;        
+--where account_date  BETWEEN TRUNC (ADD_MONTHS (to_date('02/oct/2017','dd/mm/yyyy'),-1),'month')    AND LAST_DAY (add_months(to_date('02/oct/2017','dd/mm/yyyy'),-1))
+--        group by reference_id ,p.policy_id,account_date) gl on p.policy_id = gl.policy_id  and gl.account_date  BETWEEN TRUNC (ADD_MONTHS (to_date('02/oct/2017','dd/mm/yyyy'),-1),'month')    AND LAST_DAY (add_months(to_date('02/oct/2017','dd/mm/yyyy'),-1));
+
+BEGIN
+
+v_start:= sysdate;
+   dt_debitare := DATA_RAPORT;
+
+  IF (zi_lucratoare (dt_debitare) = 1
+       OR TO_NUMBER (TO_CHAR (dt_debitare, 'D')) IN (1, 7))
+   THEN
+      IF (zi_lucratoare (dt_debitare + 1) = 1
+          OR TO_NUMBER (TO_CHAR (dt_debitare + 1, 'D')) IN (1, 7))
+      THEN
+         IF (zi_lucratoare (dt_debitare + 2) = 1
+             OR TO_NUMBER (TO_CHAR (dt_debitare + 2, 'D')) IN (1, 7))
+         THEN
+            IF (zi_lucratoare (dt_debitare + 3) = 1
+                OR TO_NUMBER (TO_CHAR (dt_debitare + 3, 'D')) IN (1, 7))
+            THEN
+               dt_debitare := dt_debitare + 4;
+            ELSE
+               dt_debitare := dt_debitare + 3;
+            END IF;
+         ELSE
+            dt_debitare := dt_debitare + 2;
+         END IF;
+      ELSE
+         dt_debitare := dt_debitare + 1;
+      END IF;
+   END IF;
+   --Borderou_comisionGroupamaTMK_mmyyyy.csv 
+      
+   select ftp_ip,ftp_user, ftp_pass, db_dir_pol, db_dir_pol_bk, ftp_dir_received||'/',ftp_port
+          into ftp_ip,ftp_user, ftp_pass, dir_from ,db_dir_pol_bk  , ftp_dir_to,         ftp_port
+     from usr_ppi_clients where client_name = 'OTP';
+     
+      select 
+            MAIL_TO,
+            MAIL_TO_2,
+            MAIL_ACCOUNT_INFORMARE,
+            MAIL_ACCOUNT_ERORI
+        INTO
+            V_MAIL_TO,
+            V_MAIL_TO_2,
+            V_MAIL_ACCOUNT_INFORMARE,
+            V_MAIL_ACCOUNT_ERORI
+from configurare_ftp where SEQ_ID_INCASARI_FTP =7;
+
+    --formez numele
+   l_file_name :=      'Borderou_comisionGroupamaTMK_' || TO_CHAR (dt_debitare, 'YYYYMMDD') || '.csv';
+   --deschid fisierul pt citire
+   vFile := UTL_FILE.fopen (dir_from, l_file_name, 'w');
+  
+
+
+   --inserez capatul de tabel
+
+   l_line :=
+         'CNP|'
+      || 'Nume prenume|'
+      || 'Numar certificat|'
+      || 'Prima lunara debitata/restituita|'
+      || 'Data debitarii/restituirii|'
+--      || 'Prima de asigurare anuala|'
+      || 'Comision banca|'
+      || 'Moneda'
+      || CHR (13);
+   UTL_FILE.PUT_LINE (vFile, l_line);
+   
+   
+   FOR cursor_inc IN CURSOR_INCASARI
+   LOOP
+      
+      l_line :=      cursor_inc.CNP ||'|'||
+                        cursor_inc. Nume||'|'||
+                        cursor_inc.policy_no||'|'||
+                        cursor_inc.OP_amount||'|'||
+                        cursor_inc.voucher_date||'|'||
+                        cursor_inc.Comision||'|'||
+                        cursor_inc.moneda || CHR (13);
+                        
+         UTL_FILE.PUT_LINE (vFile, l_line);
+   END LOOP;              
+   
+      UTL_FILE.fclose (vFile);
+
+
+     
+           l_conn := ftp.login(ftp_ip, ftp_port,ftp_user, ftp_pass);
+            ftp.ascii(p_conn => l_conn);
+            ftp.put(p_conn      => l_conn,
+            p_from_dir  =>dir_from,
+            p_from_file => l_file_name,
+            p_to_file   => ftp_dir_to||l_file_name);
+  ftp.logout(l_conn);             
+  
+              
+v_prefix:= EXTRACT(hour FROM SYSTIMESTAMP)  || EXTRACT(MINUTE FROM SYSTIMESTAMP)  ||to_char(SYSTIMESTAMP,'ss')  || to_char (SYSTIMESTAMP,'ddmmyyyy')||'_' ;
+utl_file.fcopy   (
+                        src_location   => dir_from,
+                        src_filename  => l_file_name,
+                        dest_location  =>db_dir_pol_bk,
+                        dest_filename => v_prefix|| l_file_name
+                        );
+----     
+begin                   
+utl_file.fremove
+                ( location     =>dir_from,
+                  filename  => l_file_name
+                  );
+                    
+  EXCEPTION WHEN UTL_FILE.DELETE_FAILED
+  THEN     
+ -- v_err :=SQLERRM;
+   -- INSERT INTO  ERROR_LOG_FILES VALUES ( SEQ_ERROR_LOG_FILES.NEXTVAL, 'SQLERRM : '||v_err|| 'Error when attempting to remove file '|| l_file_name || 'from location '|| dir_from|| 'when running  procedure OTP_BORDEROU_COMISION', SYSDATE);
+             PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||DATA_RAPORT  );   
+                 utl_mail.send(V_MAIL_ACCOUNT_ERORI, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+                 WHEN   UTL_FILE.INVALID_OPERATION THEN 
+  --v_err :=SQLERRM;              
+ --  INSERT INTO  ERROR_LOG_FILES VALUES ( SEQ_ERROR_LOG_FILES.NEXTVAL, 'SQLERRM : '||v_err|| 'Unable to find and remove file '|| l_file_name || 'from location '|| dir_from|| 'when running  procedure OTP_BORDEROU_COMISION', SYSDATE);
+           PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||DATA_RAPORT  );           
+           utl_mail.send(V_MAIL_ACCOUNT_ERORI, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+end;
+
+
+  
+ v_end:= sysdate;
+
+ utl_mail.send(V_MAIL_ACCOUNT_INFORMARE, V_MAIL_TO, V_MAIL_TO_2,'catalin.oprea@groupama.ro','Succes','Procedura OTP_BORDEROU_COMISION  a fost rulata  cu succes! Start_time:' || v_start ||'  End_time : '|| v_end, NULL);  
+exception
+--         WHEN utl_smtp.Transient_Error OR utl_smtp.Permanent_Error then
+--           raise_application_error(-20000, 'Unable to send mail', TRUE);
+when others  then 
+        utl_mail.send(V_MAIL_ACCOUNT_ERORI, V_MAIL_TO, V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare al procedura OTP_BORDEROU_COMISION  ! Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+            PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||DATA_RAPORT  ); 
+
+
+
+END OTP_BORDEROU_COMISION;
+
+PROCEDURE OTP_FISIER_CLIENTI (DATA_RAPORT DATE)
+AS
+--   DECLARE   DATA_RAPORT DATE:= '12-oct-2017';
+
+   dt_debitare   DATE;
+   l_file_name   VARCHAR2 (60);
+   vFile         UTL_FILE.file_type;
+   l_conn  UTL_TCP.connection;
+   l_line        VARCHAR2 (4000);
+   ftp_ip        VARCHAR (12);
+   ftp_user      VARCHAR (15);
+   ftp_pass      VARCHAR (20);
+   dir_from      VARCHAR (20);
+   ftp_dir_to    VARCHAR (20);
+   ftp_port      NUMBER;
+   v_start date;
+   v_end date;
+   db_dir_pol_bk varchar2 (30);
+   v_prefix varchar2(15);
+   v_err varchar2(2000);
+    V_MAIL_TO           CONFIGURARE_FTP.MAIL_TO%TYPE;
+    V_MAIL_TO_2       CONFIGURARE_FTP.MAIL_TO_2%TYPE;
+    V_MAIL_ACCOUNT_INFORMARE           CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE %TYPE;
+    V_MAIL_ACCOUNT_ERORI       CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+
+   CURSOR cursor_Fisier_Clienti
+   IS
+      SELECT ppi.egn CNP,
+             ppi.name Nume,
+             p.policy_no,
+             TO_CHAR (p.insr_begin, 'DD.MM.YYYY') AS insr_begin,
+             CASE i.pay_way
+                WHEN 12 THEN lp.gross_annual
+                WHEN 6 THEN lp.gross_semiann
+                WHEN 3 THEN lp.gross_quart
+                WHEN 1 THEN lp.gross_month
+             END
+                AS Prima,
+             lp.gross_month * 12 Prima_anuala,
+             pd.cond_value IBAN_Client,
+             --voucher_date,
+             i.currency,
+             ' ' Unitate_Bancara,
+             CASE
+                WHEN policy_state IN (0, 11, 12) THEN 'Activ'
+                WHEN policy_state = 30 THEN 'Sters'
+             END
+                AS Stare_client,
+             rez.pay_doc_date Data_solicitarii_rezilierii,
+             CASE
+                WHEN policy_state= 30 and rez.pay_doc is null THEN 'Rata neplatita'
+                WHEN policy_state= 30 and rez.pay_doc = 'RC' THEN 'Reziliata la cerere client'
+                ELSE ' '
+             END
+                AS Motiv_reziliere
+        FROM policy p
+             JOIN insureds i
+                ON i.policy_id = p.policy_id                      ---asigurati
+             JOIN p_people ppi
+                ON i.man_id = ppi.man_id
+             JOIN policy_conditions pc
+                ON     pc.policy_id = p.policy_id
+                   AND pc.cond_type = 'MANDAT_OTP'
+                   AND pc.cond_dimension ='A'
+             JOIN policy_conditions pd
+                ON pd.policy_id = p.policy_id AND pd.cond_type = 'IBAN_ASIG'
+             INNER JOIN install_doc inst
+                ON p.policy_id = inst.policy_id
+             INNER JOIN life_prem lp
+                ON lp.POLICY_ID = p.policy_id
+             LEFT JOIN (  SELECT p.policy_id,
+                                 MAX (pay_doc_date) pay_doc_date,
+                                 pay_doc
+                            FROM    policy p
+                                 INNER JOIN
+                                    life_close_payments lcp
+                                 ON p.policy_id = lcp.policy_id
+                           WHERE policy_ref IN
+                                    ( (SELECT framecontract
+                                         FROM USR_CFG_TABLE_PPI
+                                        WHERE client_code = 1040023845))
+                                 AND policy_state = 30
+                        GROUP BY p.policy_id, pay_doc) rez
+                ON p.policy_id = rez.policy_id
+       WHERE  p.insr_type = 5002 
+       and p.policy_ref in (SELECT framecontract FROM USR_CFG_TABLE_PPI WHERE client_code = 1040023845)
+       and ((P.POLICY_STATE IN (0, 11, 12)
+              AND (P.insr_begin BETWEEN TRUNC (ADD_MONTHS (dt_debitare, -1),'month')AND LAST_DAY (add_months(dt_debitare,-1))))
+             OR (P.POLICY_STATE IN (30) AND NVL (rez.pay_doc_date, '01-jan-1900') BETWEEN TRUNC (ADD_MONTHS (dt_debitare,-1),'month')    AND LAST_DAY (add_months(dt_debitare,-1))));
+BEGIN
+   ---NU ARE NICI O LEGATURA DENUMIREA DT_DEBITARE CU VARIABILA IN SINE. AM COPIAT CODUL ASA CUM ESTE SI IN CELALALTE PROCEDURI PENTRU A FI MAI USOR DE URMARIT MODIFICAT
+v_start:= to_date(SYSDATE, 'DD-MM-YYYY HH24:MI:SS');
+   dt_debitare := DATA_RAPORT;
+
+
+   IF (zi_lucratoare (dt_debitare) = 1
+       OR TO_NUMBER (TO_CHAR (dt_debitare, 'D')) IN (1, 7))
+   THEN
+      IF (zi_lucratoare (dt_debitare + 1) = 1
+          OR TO_NUMBER (TO_CHAR (dt_debitare + 1, 'D')) IN (1, 7))
+      THEN
+         IF (zi_lucratoare (dt_debitare + 2) = 1
+             OR TO_NUMBER (TO_CHAR (dt_debitare + 2, 'D')) IN (1, 7))
+         THEN
+            IF (zi_lucratoare (dt_debitare + 3) = 1
+                OR TO_NUMBER (TO_CHAR (dt_debitare + 3, 'D')) IN (1, 7))
+            THEN
+               dt_debitare := dt_debitare + 4;
+            ELSE
+               dt_debitare := dt_debitare + 3;
+            END IF;
+         ELSE
+            dt_debitare := dt_debitare + 2;
+         END IF;
+      ELSE
+         dt_debitare := dt_debitare + 1;
+      END IF;
+   END IF;
+
+
+
+   select ftp_ip,ftp_user, ftp_pass, db_dir_pol,db_dir_pol_bk, ftp_dir_received||'/',ftp_port
+          into ftp_ip,ftp_user, ftp_pass, dir_from,db_dir_pol_bk   , ftp_dir_to,         ftp_port
+     from usr_ppi_clients where client_name = 'OTP';
+     
+           select 
+            MAIL_TO,
+            MAIL_TO_2,
+            MAIL_ACCOUNT_INFORMARE,
+            MAIL_ACCOUNT_ERORI
+        INTO
+            V_MAIL_TO,
+            V_MAIL_TO_2,
+            V_MAIL_ACCOUNT_INFORMARE,
+            V_MAIL_ACCOUNT_ERORI
+from configurare_ftp where  SEQ_ID_INCASARI_FTP = 7;
+--SELECT * FROM CONFIGURARE_FTP
+
+   --formez numele
+   l_file_name :=      'Clienti_GroupamaTMK' || TO_CHAR (dt_debitare, 'YYYYMMDD') || '.csv';
+   --deschid fisierul pt citire
+   vFile := UTL_FILE.fopen (dir_from, l_file_name, 'w');
+
+
+   --inserez capatul de tabel
+
+   l_line :=
+         'CNP|'
+      || 'Nume prenume|'
+      || 'Certificat de asigurare|'
+      || 'Data inceput  asigurare|'
+      || 'Prima de asigurare lunara|'
+      || 'Prima de asigurare anuala|'
+      || 'IBAN|'
+      || 'Moneda|'
+      || 'Denumirea unitatii Bancii|'
+      || 'Stare client|'
+      || 'Data solicitarii rezilierii|'
+      || 'Motiv reziliere|'
+      || CHR (13);
+   UTL_FILE.PUT_LINE (vFile, l_line);
+
+
+   FOR cursor_clienti IN cursor_Fisier_Clienti
+   LOOP
+      l_line :=
+            cursor_clienti.cnp
+         || '|'
+         || cursor_clienti.nume
+         || '|'
+         || cursor_clienti.policy_no
+         || '|'
+         || cursor_clienti.insr_begin
+         || '|'
+         || cursor_clienti.prima
+         || '|'
+         || cursor_clienti.prima_anuala
+         || '|'
+         || cursor_clienti.iban_client
+         || '|'
+         || cursor_clienti.currency
+         || '|'
+         || cursor_clienti.unitate_bancara
+         || '|'
+         || cursor_clienti.Stare_client
+         || '|'
+         || cursor_clienti.Data_solicitarii_rezilierii
+         || '|'
+         || cursor_clienti.Motiv_reziliere
+         || CHR (13);
+
+      UTL_FILE.PUT_LINE (vFile, l_line);
+   END LOOP;
+
+   UTL_FILE.fclose (vFile);
+   
+           l_conn := ftp.login(ftp_ip, ftp_port,ftp_user, ftp_pass);
+            ftp.ascii(p_conn => l_conn);
+            ftp.put(p_conn      => l_conn,
+            p_from_dir  =>dir_from,
+            p_from_file => l_file_name,
+            p_to_file   => ftp_dir_to||l_file_name);
+  ftp.logout(l_conn);             
+ v_end:= to_date(SYSDATE, 'DD-MM-YYYY HH24:MI:SS');
+ 
+ 
+ v_prefix:= EXTRACT(hour FROM SYSTIMESTAMP)  || EXTRACT(MINUTE FROM SYSTIMESTAMP)  ||to_char(SYSTIMESTAMP,'ss')  || to_char (SYSTIMESTAMP,'ddmmyyyy')||'_' ;
+utl_file.fcopy   (
+                        src_location   => dir_from,
+                        src_filename  => l_file_name,
+                        dest_location  =>db_dir_pol_bk,
+                        dest_filename => v_prefix|| l_file_name
+                        );
+----     
+begin                   
+utl_file.fremove
+                ( location     =>dir_from,
+                  filename  => l_file_name
+                  );
+                    
+  EXCEPTION WHEN UTL_FILE.DELETE_FAILED
+  THEN     
+  v_err :=SQLERRM;
+    --INSERT INTO  ERROR_LOG_FILES VALUES ( SEQ_ERROR_LOG_FILES.NEXTVAL, 'SQLERRM : '||v_err|| 'Error when attempting to remove file '|| l_file_name || 'from location '|| dir_from|| 'when running  procedure OTP_FISIER_CLIENTI', SYSDATE);
+                   utl_mail.send(V_MAIL_ACCOUNT_ERORI, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+                     PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||DATA_RAPORT  ); 
+                 WHEN   UTL_FILE.INVALID_OPERATION THEN 
+  v_err :=SQLERRM;              
+  -- INSERT INTO  ERROR_LOG_FILES VALUES ( SEQ_ERROR_LOG_FILES.NEXTVAL, 'SQLERRM : '||v_err|| 'Unable to find and remove file '|| l_file_name || 'from location '|| dir_from|| 'when running  procedure OTP_FISIER_CLIENTI', SYSDATE);
+                     utl_mail.send(V_MAIL_ACCOUNT_ERORI,V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare!'|| SQLERRM|| 'Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+                       PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||DATA_RAPORT  ); 
+end;
+
+ 
+ 
+
+ utl_mail.send(V_MAIL_ACCOUNT_INFORMARE, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Succes','Procedura FISIER CLIENTI  a fost rulata  cu succes! Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+exception
+--         WHEN utl_smtp.Transient_Error OR utl_smtp.Permanent_Error then
+--           raise_application_error(-20000, 'Unable to send mail', TRUE);
+when others  then 
+  PPI_DD_FLUX_FISIERE.LOG_ERROR (     'DIRECT_DEBIT_OTP',     'VALUE  '||DATA_RAPORT  ); 
+        utl_mail.send(V_MAIL_ACCOUNT_ERORI,V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Fail','A aparut o eroare al procedura FISIER CLIENTI   ! Start_time:' ||v_start||'  End_time : '||v_end, NULL);  
+                
+
+
+
+END OTP_FISIER_CLIENTI;
+
+PROCEDURE SP_INSERT_RASP_OTP (V_FILE_NAME    VARCHAR2,
+                                                   v_file_id      NUMERIC,
+                                                   text           VARCHAR2,
+                                                   delimitator VARCHAR2,
+                                                   p_mail_to VARCHAR2,
+                                                   p_mail_to_2 VARCHAR2,
+                                                   P_MAIL_ERR VARCHAR2)
+
+IS
+--   select * from configurare_ftp where seq_id_incasari_ftp =2 and file_mask like '%_REJTMK____GPM%';
+--DECLARE 
+--   V_FILE_NAME    VARCHAR (30) := '20171030_CONFTMKRON_GPM.txt';
+--   v_file_id      NUMBER := 1;
+--   delimitator    VARCHAR2 (4) := '|';
+--   text           VARCHAR2 (200)      := 'GPM|INCZE DORICA|2790823140311|OTPTMKIP00000108|RO84OTPV300000553444RO01| | |15.00|RON|19092017|Disponibil insuficient';
+   fir_executie   NUMBER;
+   TYPE a_array IS TABLE OF VARCHAR (200)  INDEX BY VARCHAR2 (64);
+   vector         a_array;                       -- Associative array variable
+   i              NUMBER;
+   n              NUMBER;
+   pahar          VARCHAR2 (200) := text;
+   pahar2         VARCHAR2 (200);
+   a              NUMBER;
+   
+BEGIN
+   SELECT LENGTH (text) - LENGTH (REPLACE (text, '|', '')) INTO n FROM DUAL;
+
+   FOR i IN 1 .. n
+   LOOP
+      pahar2 := SUBSTR (pahar, 1, INSTR (pahar, delimitator) - 1);
+
+      pahar := SUBSTR (pahar, INSTR (pahar, delimitator) + 1, LENGTH (pahar));
+
+      vector (i) := TRIM (pahar2);
+
+--      DBMS_OUTPUT.put_line (
+--         'Vector [' || i || '] este :=' || TRIM (vector (i)));
+
+      a := n+1;
+   END LOOP;
+
+--   DBMS_OUTPUT.put_line ('i:=' || a);
+
+
+   vector (a) := pahar;
+--   DBMS_OUTPUT.put_line (' vector (a)=' || vector (a));
+
+   SELECT COUNT (*)
+     INTO fir_executie
+     FROM configurare_ftp
+    WHERE seq_id_incasari_ftp = v_file_id
+          AND file_mask LIKE '%_CONFTMK____GPM%';
+
+   --
+   IF fir_executie <> 0
+   THEN
+      INSERT INTO raspuns_dd_otp (cod_furnizor,
+                                  nume_client,
+                                  cnp_asigurat,
+                                  numar_policy,
+                                  iban,
+                                  nr_factura,
+                                  data_emitere_polita,
+                                  suma,
+                                  valuta,
+                                  data_scadenta,
+                                  tip_rejectie,
+                                  from_file)
+           VALUES (TRIM (vector (1)),
+                   TRIM (vector (2)),
+                   TRIM (vector (3)),
+                   TRIM (vector (4)),
+                   TRIM (vector (5)),
+                   TRIM (vector (6)),
+                   TRIM (vector (7)),
+                   TRIM (vector (8)),
+                   TRIM (vector (9)),
+                   TRIM (vector (10)),
+                   'CONFIRMATA',
+                   V_FILE_NAME);
+
+--      DBMS_OUTPUT.put_line ('INSERARE CONFIRMA');
+   END IF;
+
+   fir_executie := 0;
+
+   SELECT COUNT (*)
+     INTO fir_executie
+     FROM configurare_ftp
+    WHERE seq_id_incasari_ftp = v_file_id
+          AND file_mask LIKE '%_REJTMK____GPM%';
+
+   IF fir_executie <> 0
+   THEN
+      INSERT INTO raspuns_dd_otp (cod_furnizor,
+                                  nume_client,
+                                  cnp_asigurat,
+                                  numar_policy,
+                                  iban,
+                                  nr_factura,
+                                  data_emitere_polita,
+                                  suma,
+                                  valuta,
+                                  data_scadenta,
+                                  tip_rejectie,
+                                  from_file)
+           VALUES (TRIM (vector (1)),
+                   TRIM (vector (2)),
+                   TRIM (vector (3)),
+                   TRIM (vector (4)),
+                   TRIM (vector (5)),
+                   TRIM (vector (6)),
+                   TRIM (vector (7)),
+                   TRIM (vector (8)),
+                   TRIM (vector (9)),
+                   TRIM (vector (10)),
+                   TRIM (vector (11)),
+                   V_FILE_NAME);
+
+--      DBMS_OUTPUT.put_line ('INSERARE REJECTATE');
+   END IF;
+
+   COMMIT;
+EXCEPTION
+   WHEN OTHERS
+   THEN
+      PPI_DD_FLUX_FISIERE.LOG_ERROR ('SP_INSERT_RASP_OTP', 'VALUE  ' || TEXT);
+
+      UTL_MAIL.send(P_MAIL_ERR,p_mail_to ,p_mail_to_2,'catalin.oprea@groupama.ro','Import Raspuns OTP',' A aparut o eroare la importul fisierului : '||V_FILE_NAME ||'! Eroare ORCL '|| SQLERRM||CHR(10)|| ' Urmatoare linie nu s-a importat '||text, NULL);
+  
+END SP_INSERT_RASP_OTP;
+
+PROCEDURE INCARCA_FISIERE_OPT 
+IS
+
+v_mesaj varchar2(4000);
+V_MAIL_TO           CONFIGURARE_FTP.MAIL_TO%TYPE;
+V_MAIL_TO_2           CONFIGURARE_FTP.MAIL_TO_2%TYPE;
+V_MAIL_ACCOUNT_INFORMARE           CONFIGURARE_FTP.MAIL_ACCOUNT_INFORMARE %TYPE;
+V_MAIL_ACCOUNT_ERORI       CONFIGURARE_FTP.MAIL_ACCOUNT_ERORI %TYPE;
+C_BODY CLOB;
+C_LINE VARCHAR2(2000);
+v_raspuns number;
+v_semafor_import numeric;
+cursor cursor_msg is
+with baza as (
+ SELECT  distinct tb.ID12, nr_tb, count( case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+                                           when TIp_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                           else 'REJECTATA' END) NUMAR,
+
+                                        case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+                                           when TIp_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                           else 'REJECTATA' END RASPUNS,
+--                                            to_char(to_date(id11, 'DD-MM-RRRR'), 'DDMMYYYY') ,
+--                                            id11,
+--                                           id5,
+--                                           id9,
+--                                           id10,
+                                           otp.from_file,
+                                           numar_rasp as Linii_fisier_primit
+                                          
+                                           FROM  tb_sent_dd tb 
+                        left join raspuns_dd_otp otp on tb.id5 = OTP.NUMAR_POLICY      and id9= otp.suma and id10 = valuta  AND  to_char(to_date(id11, 'DD-MM-RRRR'), 'DDMMYYYY')  = substr(DATA_SCADENTA,1,8)  and trunc(otp.insert_date) = trunc(sysdate)--importate astazi
+                        left join (select count(*) numar_rasp, from_file from  raspuns_dd_otp group by from_file)  nr_ras on OTP.FROM_FILE =nr_ras.from_file
+                        inner join (select count(*) nr_tb,id12  from tb_sent_dd where id16 is null group by id12) nr_sent on nr_sent.id12 =tb.id12
+                        WHERE ID16 is     null   AND ID15='OTP'
+                        group by tb.id12, case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+                                           when TIP_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                           else 'REJECTATA' END,otp.from_file,numar_rasp,nr_tb)
+                                           select * from baza order by id12, raspuns;
+                                           
+   
+
+
+cursor cursor_far_raspuns is
+with c_baza as (
+SELECT  distinct tb.ID12 Nume_fisier , tb.id3 as Nume, tb.id4 as CNP, tb.id5 as polita, tb.id6 as iban,tb.id9 as Suma, tb.id10 as Moneda, tb.id11 as scadenta, tb.id12 as Fisier, tb.id15 as companie,
+--                                          count( case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+--                                           when TIP_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+--                                           else 'REJECTATA' END) NUMAR,
+
+                                        case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+                                           when TIp_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                           else 'REJECTATA' END RASPUNS,
+--                                            to_char(to_date(id11, 'DD-MM-RRRR'), 'DDMMYYYY') ,
+--                                            id11,
+--                                           id5,
+--                                           id9,
+--                                           id10,
+                                           otp.from_file,
+                                           numar_rasp as Linii_fisier_primit
+                                          
+                                           FROM  tb_sent_dd tb 
+                        left join raspuns_dd_otp otp on tb.id5 = OTP.NUMAR_POLICY      and id9= otp.suma and id10 = valuta  AND  to_char(to_date(id11, 'DD-MM-RRRR'), 'DDMMYYYY')  = substr(DATA_SCADENTA,1,8)  and trunc(otp.insert_date) = trunc(sysdate)
+                        left join (select count(*) numar_rasp, from_file from  raspuns_dd_otp group by from_file)  nr_ras on OTP.FROM_FILE =nr_ras.from_file
+                        inner join (select count(*) nr_tb,id12  from tb_sent_dd where id16 is null group by id12) nr_sent on nr_sent.id12 =tb.id12
+                        WHERE ID16 is     null   AND ID15='OTP' and   case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+                                                                                                    when TIP_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                                                                                    else 'REJECTATA' END ='NU S-A PRIMIT RASPUNS')
+        select * from c_baza ;
+                                                                                                    
+                                                                                                    
+                        
+
+                                        
+                                           
+v_comanda varchar2(400);
+cursor  c_v_id is
+with baza as
+ ( SELECT * FROM CONFIGURARE_FTP WHERE (FLUX_IMPORT ='CONFIRMATA' OR  FLUX_IMPORT='REJECTATA') AND COMPANIE = 1)
+ select * from baza  ;
+
+BEGIN
+
+v_raspuns:=0;
+for cur_proc  in c_v_id  loop
+v_comanda :='';
+--dbms_output.put_line (cur_proc.seq_id_incasari_ftp);
+
+v_comanda := 'PPI_DD_FLUX_FISIERE.IMPORT_FISIERE_OTP';
+
+v_comanda := 'BEGIN '|| v_comanda || ' (:v_id); END;'; 
+execute immediate (v_comanda) USING cur_proc.seq_id_incasari_ftp;
+
+--dbms_output.put_line (v_comanda) ;
+
+end loop;
+
+
+v_semafor_import:=0;--ne spune daca avem fisiere improtate. Se considera ca toate fisierele vin simultan.
+
+select count(*) into v_semafor_import from raspuns_dd_otp otp where trunc(otp.insert_date) = trunc(sysdate);
+
+if v_semafor_import <>0 then
+
+
+for i in   cursor_msg
+loop
+v_mesaj:=v_mesaj  || ('Fisierul trimis '||i.id12 ||' contine: ' ||i.nr_tb ||' linii. Avem ' ||i.numar||'  inregistrari cu status ' ||i.raspuns || case when i.from_file is null then '' else' din fisierul ' ||i.from_file||' care are un numar total de linii:'||i.linii_fisier_primit end)||CHR(10) || CHR(10);
+
+
+end loop;
+c_body :=  'NUME_FISIER'||','|| 'NUME'||','||'CNP'||','|| 'POLITA'||','|| 'IBAN'||','||'SUMA'||','||'MONEDA'||','||'SCADENTA'||','||'FISIER'||',' ||'COMPANIE' ||chr(10);
+
+for rasp in cursor_far_raspuns loop
+    
+        
+        c_line := rasp.NUME_FISIER||','|| rasp.NUME||','||rasp.CNP||','|| rasp.POLITA||','|| rasp.iban||','||rasp.suma||','||rasp.moneda||','||rasp.scadenta||','||rasp.fisier||',' ||rasp.companie  ||chr(10);
+        
+        c_body := c_body||c_line;
+  v_raspuns:=v_raspuns+1;
+    end loop;
+ 
+                                                       
+    
+--dbms_output.put_line  (v_mesaj);
+SELECT 
+                         MAIL_ACCOUNT_INFORMARE
+                        ,MAIL_ACCOUNT_ERORI
+                        ,MAIL_TO
+                        ,MAIL_TO_2
+INTO           
+                         V_MAIL_ACCOUNT_INFORMARE
+                        ,V_MAIL_ACCOUNT_ERORI
+                        ,V_MAIL_TO
+                        ,V_MAIL_TO_2              
+ FROM CONFIGURARE_FTP
+ WHERE FILE_MASK ='DebitareGroupamaGPMTK'  AND ROWNUM=1;
+
+---utl_mail.send(V_MAIL_ACCOUNT_INFORMARE, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Notificare',v_mesaj, NULL);  
+
+   
+     mail_attach.send_mail   (              V_MAIL_TO,
+                                                       V_MAIL_TO_2,-- 'violeta.anton@groupama.ro',      
+                                                       null,
+                                                       V_MAIL_ACCOUNT_INFORMARE,
+                                                       'Notificare ',
+                                                       v_mesaj||CHR(10)||case when v_raspuns>0 then 'Politele care nu au primit raspuns se regasesc in fisierul atasat: Polite_fara_Raspuns_otp.csv.' else ' ' end||chr(13)||chr(13)||'O zi buna,'||chr(10)||'IT Groupama' ,
+                                                       'Polite_fara_Raspuns_otp.csv',
+                                                       'text/plain',
+                                                       c_body,
+                                                       'smtpprod.groupama.ro',
+                                                       25); 
+                                                       
+
+
+MERGE
+INTO    TB_SENT_DD TD
+USING   (
+          SELECT  distinct ID12, case   when TIP_REJECTIE  IS NULL THEN 'NU A PRIMIT RASPUNS'
+                                           when TIp_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                           else 'REJECTATA' END NUMAR,
+
+                                        case   when TIP_REJECTIE  IS NULL THEN 'NU S-A PRIMIT RASPUNS'
+                                           when TIp_REJECTIE = 'CONFIRMATA' THEN 'CONFIRMATA' 
+                                           else 'REJECTATA' END RASPUNS, 
+                                            to_char(to_date(id11, 'DD-MM-RRRR'), 'DDMMYYYY') ,
+                                            id11,
+                                           id5,
+                                           id9,
+                                           id10,
+                                           otp.from_file
+                                           FROM  tb_sent_dd tb 
+                       left join raspuns_dd_otp otp on tb.id5 = OTP.NUMAR_POLICY      and id9= otp.suma and id10 = valuta  AND  to_char(to_date(id11, 'DD-MM-RRRR'), 'DDMMYYYY')  = substr(DATA_SCADENTA,1,8)  and trunc(otp.insert_date) = trunc(sysdate)
+                        WHERE ID16 is  null     AND ID15='OTP' --CELE CARE NU AU RASPUNS
+        ) src
+ON      (   src.ID12 =td.id12 and src.id11 =td.id11 and src.id5=td.id5 and src.id9= td.id9    and src.id10=td.id10     AND ID15='OTP' )
+WHEN MATCHED THEN UPDATE
+    SET td.id16 = RASPUNS, td.id17 =from_file;
+    
+COMMIT;
+
+else
+null;
+
+end if;
+
+
+exception when others then 
+
+PPI_DD_FLUX_FISIERE.LOG_ERROR ('INCARCA_FISIERE_OPT',     'JOB'  ); 
+
+utl_mail.send(V_MAIL_ACCOUNT_ERORI, V_MAIL_TO,V_MAIL_TO_2,'catalin.oprea@groupama.ro','Notificare',v_mesaj, NULL);  
+
+rollback;
+END INCARCA_FISIERE_OPT;
+
+PROCEDURE RUN_PPI_JOB_PAY_AUTOMATIC  (pp_id number )
+is
+
+v_file_id number;
+v_msg varchar2(400);
+a number;
+
+v_mail_msg varchar2(4000);
+l_subject varchar2(1000);
+
+cursor c_get_P(v_fil number) is
+select count(*) from
+usrgam_imp_pay_ppi i
+where i.file_id=v_fil
+and i.state='P';
+
+cursor c_get_E(v_fil number) is
+select count(*) from
+usrgam_imp_pay_ppi i
+where i.file_id=v_fil
+and i.state='E';
+
+
+cursor c_get_N(v_fil number) is
+select count(*) from
+usrgam_imp_pay_ppi i
+where i.file_id=v_fil
+and i.state is null;
+
+v_p number;
+v_e number;
+v_n number;
+
+---Automatic Payments:
+cursor c_automatic_pay is
+select id from usr_ppi_payment_files where state is null
+and FTP_LOAD_STATE = 'YES' and id = pp_id /*and file_id is not null*/ --se executa in functie de parametru nu mai ia tot cursorul
+order by id;
+
+v_id number;
+---End Automatic Payments
+
+-- Andriqn 14.09.2012
+cursor c_take_file_id(p_rec_id number) is
+select file_id
+from temp_table_ppi_pay t where  t.rec_id =  p_rec_id;
+--end Andriqn
+begin
+
+/*v_file_id:=null; -- Andriqn
+ppi_pay_f(v_file_id,v_msg);
+commit;*/ -- Andriqn
+
+
+--Automatic payments:
+/* open c_automatic_pay;
+fetch c_automatic_pay into v_id;
+close c_automatic_pay;*/
+--End automatic payments
+for ll in c_automatic_pay  loop
+for rec in c_take_file_id(ll.id) loop -- Andriqn
+v_file_id := rec.file_id; -- Andriqn
+
+If v_file_id is not null then
+
+  if not PROCESS_IO_FILES.usrgam_pay_ppi_multy_diana (v_file_id,v_msg) then
+        l_subject:='Error PPI Pay Policy '||sysdate;
+        v_mail_msg:=v_msg||' with File_ID:'||v_file_id||'.'
+                    ||chr(10)||' Error when pay policy'||v_msg;
+        update usr_ppi_payment_files t set t.file_id=v_file_id, t.state='E' where t.id=ll.id;
+      
+    SEND_MAIL_LOG(5001,l_subject,v_mail_msg); --Andrian
+
+   else
+
+     v_p:=0;
+     v_e:=0;
+     v_n:=0;
+
+     open c_get_P(v_file_id);
+     fetch c_get_P into v_p;
+     close c_get_P;
+
+     open c_get_e(v_file_id);
+     fetch c_get_e into v_e;
+     close c_get_e;
+
+
+     open c_get_n(v_file_id);
+     fetch c_get_n into v_n;
+     close c_get_n;
+
+  l_subject:=v_file_id||' OK! PPI Pay Policy Successfully '||sysdate;
+
+  v_mail_msg:=v_msg||' with File_ID:'||v_file_id||'.'
+                    ||chr(10)||' Policies are paid with status'||chr(10)||
+                    ' Paid Polices: '||v_p||chr(10)||
+                    ' Error Paid: '||v_e||chr(10);
+   update usr_ppi_payment_files t set t.file_id=v_file_id, t.state='L' where t.id=ll.id;
+   SEND_MAIL_LOG(5001,l_subject,v_mail_msg); --Andrian
+
+
+  end if;
+
+
+
+ ELSE
+
+
+
+     l_subject:='Error PPI Import Date from File/Ftp PAY '||sysdate;
+        v_mail_msg:=v_msg||'.'
+                   ||chr(10)||'Error when import data from FTP!';
+
+       SEND_MAIL_LOG(5001,l_subject,v_mail_msg); --Andrian
+
+
+End if;
+end loop;
+
+end loop;
+end RUN_PPI_JOB_PAY_AUTOMATIC;
+
+procedure PPI_PAYMENT_UPLOAD_CHECK_autom (p_id number,P_MAIL_INF VARCHAR2, P_MAIL_ERR VARCHAR2,P_MAIL_TO_1 VARCHAR2,P_MAIL_TO_2 VARCHAR2 )
+ is -- Andriqn
+---Automatic Payments:
+cursor c_automatic_pay is
+select * from usr_ppi_payment_files where  check_file  = 1 /*and state is null*/ and file_id is null and (ftp_load_state <> 'YES' or ftp_load_state is null  ) and id =p_id order by id;
+---End Automatic Payments
+
+---Automatic Payments:
+cursor c_automatic_pay_err is
+select id, file_name from usr_ppi_payment_files where state='E' and id =p_id ;
+v_id number;
+v_file_name varchar2(50);
+FILE_ID VARCHAR2(50);
+RETURN_MESSAGE VARCHAR2(200);
+---End Automatic Payments
+v_file_id number;
+v_msg varchar2(400);
+v_msg_io varchar2(400);
+
+---aici verifica ca  ppi_pay_f a inserat in tabele
+cursor c_ch_state(p_file_ss number) is
+select 'X'
+from usrgam_imp_pay_ppi ppi,
+PPI_LOG_PAY plog
+where ppi.file_id = plog.file_id
+and (ppi.state = 'P' or ppi.state  is null)
+and state_insert_table = 'L'
+and ppi.file_id = p_file_ss;
+
+
+cursor c_notchecked is
+select id from usr_ppi_payment_files where (check_file is null or check_file <> 1) and file_id is null and id =p_id  order by id;
+
+l_ch_state varchar2(2);
+
+BEGIN
+
+
+for tmp in c_automatic_pay loop
+
+
+
+  FILE_ID := tmp.file_name;
+  if USEREXIT_GISB_PPI.FTP_GET_CHECK ( FILE_ID, 'PPI', RETURN_MESSAGE ) = 0 then
+  null;
+
+else
+
+
+  if tmp.file_name = 'ppi_payment.txt' then
+    null;
+  else
+    UTL_FILE.FRENAME ('PPI',tmp.file_name,'PPI','ppi_payment.txt',true);
+  end if;
+
+ v_file_id:=null;
+ ppi_pay_f(tmp.id,v_file_id,v_msg);
+
+
+open c_ch_state(v_file_id);
+ fetch c_ch_state into l_ch_state;
+  if c_ch_state%found  then
+    update usr_ppi_payment_files t set t.ftp_load_state = 'YES' where t.id = tmp.id;
+   
+        PPI_DD_FLUX_FISIERE.RUN_PPI_JOB_PAY_AUTOMATIC (p_id);
+                utl_mail.send(P_MAIL_INF,P_MAIL_TO_1 ,P_MAIL_TO_2,'catalin.oprea@groupama.ro','Procesare fisier '||v_file_id,'PPI_PAYMENT_UPLOAD_CHECK_automatic ! Fisier prelucrat cu succes:' ||v_file_id, NULL); 
+    else
+    update usr_ppi_payment_files t set t.ftp_load_state = 'ERROR' where t.id = tmp.id;
+        utl_mail.send(P_MAIL_ERR, P_MAIL_TO_1 ,P_MAIL_TO_2,'catalin.oprea@groupama.ro','Procesare fisier '||v_file_id,'PPI_PAYMENT_UPLOAD_CHECK_automatic ! Fisier prelucrat cu EROARE:' ||v_file_id, NULL); 
+
+  end if;
+ close c_ch_state;
+ 
+commit;
+
+ -- UTL_FILE.FRENAME ('PPI','ppi_payment.txt','PPI_BACKUP',tmp.file_name||'_'||TO_CHAR(SYSDATE,'YYYYMMDD_HHMMSS'),true);
+utl_file.fremove('PPI', 'ppi_payment.txt');
+ end if;
+
+end loop;
+
+
+for rec in c_notchecked loop
+update usr_ppi_payment_files t set t.ftp_load_state = 'NOT CHEKED' where t.id = rec.id;
+end loop;
+
+
+END PPI_PAYMENT_UPLOAD_CHECK_autom;
+
+PROCEDURE SEND_MAIL_LOG(pi_insr_type in number,
+                        pi_subject in varchar2,
+                        pi_msg varchar2)
+                         is
+
+    SMTP_SERVER varchar2(100):='smtpprod.groupama.ro';
+    SENDER varchar2(100):='insislifeprod@groupama.ro';
+
+  cursor c_get_mail_adr is
+    select cf.e_mail
+    from
+    USR_CFG_MAIL_LOG cf
+    where
+    cf.insr_type=pi_insr_type
+    and cf.active='Y';
+
+begin
+
+For mlp in c_get_mail_adr loop
+
+MAIL_SERVICES.Mail       (SMTP_SERVER, 25,
+                          SENDER, mlp.e_mail,
+                          user||': '||pi_subject, pi_msg);
+
+
+end loop;
+
+end SEND_MAIL_LOG;
+
+PROCEDURE LOG_ERROR ( TITLE_IN IN  ERROR_LOG.TITLE%TYPE, 
+                                                                                               INFO_IN  IN  ERROR_LOG.INFO%TYPE)
+--        AUTHID DEFINER
+IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+BEGIN
+
+INSERT INTO ERROR_LOG
+
+VALUES (SEQ_ERROR_LOG.NEXTVAL,
+                                        TITLE_IN,
+                                        INFO_IN,
+                                        SYSDATE,
+                                        USER,
+                                        DBMS_UTILITY.FORMAT_CALL_STACK,
+                                        DBMS_UTILITY.FORMAT_ERROR_STACK,
+                                       DBMS_UTILITY.FORMAT_ERROR_BACKTRACE );
+                              
+COMMIT;
+END LOG_ERROR;
+
+END PPI_DD_FLUX_FISIERE;
+/
